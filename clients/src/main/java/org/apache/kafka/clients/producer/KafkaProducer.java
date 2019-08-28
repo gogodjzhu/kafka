@@ -232,11 +232,14 @@ public class KafkaProducer<K, V> implements Producer<K, V> {
     private String clientId;
     // Visible for testing
     final Metrics metrics;
+    // 分区计算器
     private final Partitioner partitioner;
     private final int maxRequestSize;
     private final long totalMemorySize;
+    // 集群元数据
     private final Metadata metadata;
     private final RecordAccumulator accumulator;
+    // 消息发送线程
     private final Sender sender;
     private final Thread ioThread;
     private final CompressionType compressionType;
@@ -403,6 +406,7 @@ public class KafkaProducer<K, V> implements Producer<K, V> {
                     this.transactionManager,
                     apiVersions);
             String ioThreadName = "kafka-producer-network-thread" + (clientId.length() > 0 ? " | " + clientId : "");
+            // sender作为唯一的子线程处理发送消息操作
             this.ioThread = new KafkaThread(ioThreadName, this.sender, true);
             this.ioThread.start();
             this.errors = this.metrics.sensor("errors");
@@ -752,9 +756,12 @@ public class KafkaProducer<K, V> implements Producer<K, V> {
         TopicPartition tp = null;
         try {
             // first make sure the metadata for the topic is available
+            // 获取集群基础信息
             ClusterAndWaitTime clusterAndWaitTime = waitOnMetadata(record.topic(), record.partition(), maxBlockTimeMs);
             long remainingWaitMs = Math.max(0, maxBlockTimeMs - clusterAndWaitTime.waitedOnMetadataMs);
             Cluster cluster = clusterAndWaitTime.cluster;
+
+            /** 序列化key 和 value*/
             byte[] serializedKey;
             try {
                 serializedKey = keySerializer.serialize(record.topic(), record.headers(), record.key());
@@ -771,27 +778,39 @@ public class KafkaProducer<K, V> implements Producer<K, V> {
                         " to class " + producerConfig.getClass(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG).getName() +
                         " specified in value.serializer");
             }
+
+            // 计算目标partition
             int partition = partition(record, serializedKey, serializedValue, cluster);
             tp = new TopicPartition(record.topic(), partition);
 
             setReadOnly(record.headers());
             Header[] headers = record.headers().toArray();
 
+            // 预估消息大小，保证不超过限定
             int serializedSize = AbstractRecords.estimateSizeInBytesUpperBound(apiVersions.maxUsableProduceMagic(),
                     compressionType, serializedKey, serializedValue, headers);
             ensureValidRecordSize(serializedSize);
+
+            // 时间戳, 未设置则使用系统时间
             long timestamp = record.timestamp() == null ? time.milliseconds() : record.timestamp();
             log.trace("Sending record {} with callback {} to topic {} partition {}", record, callback, record.topic(), partition);
             // producer callback will make sure to call both 'callback' and interceptor callback
+            // 回调方法
             Callback interceptCallback = this.interceptors == null ? callback : new InterceptorCallback<>(callback, this.interceptors, tp);
 
+            // 事务管理
+            // KNOWLEDGE 事务原理?
             if (transactionManager != null && transactionManager.isTransactional())
                 transactionManager.maybeAddPartitionToTransaction(tp);
 
+            // 将消息添加到缓存队列中
+            // KNOWLEDGE 缓存队列原理?
             RecordAccumulator.RecordAppendResult result = accumulator.append(tp, timestamp, serializedKey,
                     serializedValue, headers, interceptCallback, remainingWaitMs);
+            // 缓存满了则唤醒sender做数据发送
             if (result.batchIsFull || result.newBatchCreated) {
                 log.trace("Waking up the sender since topic {} partition {} is either full or getting a new batch", record.topic(), partition);
+                // KNOWLEDGE 队列唤醒策略?
                 this.sender.wakeup();
             }
             return result.future;
@@ -838,15 +857,22 @@ public class KafkaProducer<K, V> implements Producer<K, V> {
 
     /**
      * Wait for cluster metadata including partitions for the given topic to be available.
+     * 等待获取集群基础信息
      * @param topic The topic we want metadata for
      * @param partition A specific partition expected to exist in metadata, or null if there's no preference
      * @param maxWaitMs The maximum time in ms for waiting on the metadata
      * @return The cluster containing topic metadata and the amount of time we waited in ms
+     *         返回的对象包含topic的元数据, 还有为了获取该新信息耗费的时间. 如果直接通过
+     *         缓存获取, 耗费时间设置为0
      */
     private ClusterAndWaitTime waitOnMetadata(String topic, Integer partition, long maxWaitMs) throws InterruptedException {
         // add topic to metadata topic list if it is not there already and reset expiry
+        // 如果metadata中没有topic信息, 添加之. 并修改立即更新meta标志为true. 更新操作
+        // 异步执行
         metadata.add(topic);
+        // 获取当前缓存的集群信息(上面添加的新topic可能还没来得及更新)
         Cluster cluster = metadata.fetch();
+        // 获取指定topic包含的分区数
         Integer partitionsCount = cluster.partitionCountForTopic(topic);
         // Return cached metadata if we have it, and if the record's partition is either undefined
         // or within the known partition range
@@ -860,10 +886,14 @@ public class KafkaProducer<K, V> implements Producer<K, V> {
         // In case we already have cached metadata for the topic, but the requested partition is greater
         // than expected, issue an update request only once. This is necessary in case the metadata
         // is stale and the number of partitions for this topic has increased in the meantime.
+        // 注意到这里采用的是do while循环结构, 所以判断前会先进入循环体一次. 这样做的目
+        // 的是防止在部分情况下, 指定的partitionId是新增加的partition, 而本地缓存的meta
+        // 并不是最新的, 导致无法获取合法存在的partition. 先进入循环可以先更新meta
         do {
             log.trace("Requesting metadata update for topic {}.", topic);
             metadata.add(topic);
             int version = metadata.requestUpdate();
+            // 唤醒队列, 本质是nioSelector#wakeup方法被调用
             sender.wakeup();
             try {
                 metadata.awaitUpdate(version, remainingWaitMs);
@@ -873,6 +903,7 @@ public class KafkaProducer<K, V> implements Producer<K, V> {
             }
             cluster = metadata.fetch();
             elapsed = time.milliseconds() - begin;
+            // 执行超时, 抛出异常, 退出循环
             if (elapsed >= maxWaitMs)
                 throw new TimeoutException("Failed to update metadata after " + maxWaitMs + " ms.");
             if (cluster.unauthorizedTopics().contains(topic))
@@ -881,6 +912,7 @@ public class KafkaProducer<K, V> implements Producer<K, V> {
             partitionsCount = cluster.partitionCountForTopic(topic);
         } while (partitionsCount == null);
 
+        // 未找到指定id的partition
         if (partition != null && partition >= partitionsCount) {
             throw new KafkaException(
                     String.format("Invalid partition given with record: %d is not in the range [0...%d).", partition, partitionsCount));

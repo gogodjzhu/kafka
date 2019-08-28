@@ -40,8 +40,13 @@ import java.util.Set;
  * <p>
  * This class is shared by the client thread (for partitioning) and the background sender thread.
  *
+ * 线程安全
+ *
  * Metadata is maintained for only a subset of topics, which can be added to over time. When we request metadata for a
  * topic we don't have any metadata for it will trigger a metadata update.
+ *
+ * Metadata维护的是全量topic的一个子集, 只在我们试图获取本地没有的topic时才去更新
+ *
  * <p>
  * If topic expiry is enabled for the metadata, any topic that has not been used within the expiry interval
  * is removed from the metadata refresh set after an update. Consumers disable topic expiry since they explicitly
@@ -54,15 +59,24 @@ public final class Metadata {
     public static final long TOPIC_EXPIRY_MS = 5 * 60 * 1000;
     private static final long TOPIC_EXPIRY_NEEDS_UPDATE = -1L;
 
+    // 两次更新之间的最小时间间隔, 防止太频繁的请求
     private final long refreshBackoffMs;
+    // 多久全局更新一次meta信息
     private final long metadataExpireMs;
+    // metadata版本, 每更新一次递增1
     private int version;
+    // 上一次更新时间(也包含更新失败的情况)
     private long lastRefreshMs;
+    // 上一次成功更新的时间, 如果每次都成功的话，则与lastRefreshMs相等
     private long lastSuccessfulRefreshMs;
+    // 实际保存集群信息的对象
     private Cluster cluster;
+    // 强制刷新标志
     private boolean needUpdate;
     /* Topics with expiry time */
+    // topic过期map
     private final Map<String, Long> topics;
+    // metadata事件回调方法, 目前仅提供update事件的回调
     private final List<Listener> listeners;
     private final ClusterResourceListeners clusterResourceListeners;
     private boolean needMetadataForAllTopics;
@@ -122,9 +136,14 @@ public final class Metadata {
      * The next time to update the cluster info is the maximum of the time the current info will expire and the time the
      * current info can be updated (i.e. backoff time has elapsed); If an update has been request then the expiry time
      * is now
+     * 获取从现在开始到下次需要metadata update时间, 单位ms.
+     * @return 返回距离下一次update的时间
      */
     public synchronized long timeToNextUpdate(long nowMs) {
+        // 当needUpdate=true时, 表示需要强制刷新. 则timeToExpire=0, 否则按照上一次成
+        // 功update的时间开始计算, 隔metadataExpireMs时长更新一次
         long timeToExpire = needUpdate ? 0 : Math.max(this.lastSuccessfulRefreshMs + this.metadataExpireMs - nowMs, 0);
+        // 最少需要等待refreshBackoffMs
         long timeToAllowUpdate = this.lastRefreshMs + this.refreshBackoffMs - nowMs;
         return Math.max(timeToExpire, timeToAllowUpdate);
     }

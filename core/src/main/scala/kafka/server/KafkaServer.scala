@@ -646,10 +646,17 @@ class KafkaServer(val config: KafkaConfig, time: Time = Time.SYSTEM, threadNameP
 
   /**
     * Generates new brokerId if enabled or reads from meta.properties based on following conditions
+    * BrokerId的生成策略:
     * <ol>
     * <li> config has no broker.id provided and broker id generation is enabled, generates a broker.id based on Zookeeper's sequence
+    *      配置文件没有broker.id参数, 且启动了broker.id.generation.enable配置, 则使用zk的顺序节点的特性自动生成
+    *
     * <li> stored broker.id in meta.properties doesn't match in all the log.dirs throws InconsistentBrokerIdException
+    *      meta.properties文件指定了broker.id参数, 但log.dirs 的meta文件中保存的brokerId和当前指定的brokerId不一致, 抛出异常
+    *
     * <li> config has broker.id and meta.properties contains broker.id if they don't match throws InconsistentBrokerIdException
+    *      配置中(比如kafka.properties配置文件)包含broker.id跟meta.properties配置的broker.id不一致, 抛出异常
+    *
     * <li> config has broker.id and there is no meta.properties file, creates new meta.properties and stores broker.id
     * <ol>
     *

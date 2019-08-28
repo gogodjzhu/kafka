@@ -22,6 +22,7 @@ import java.util.Map;
 
 /**
  * The state of our connection to each node in the cluster.
+ * 当前客户端对整个集群的连接状态集合, 本质是一个map(nodeId->state)
  * 
  */
 final class ClusterConnectionStates {

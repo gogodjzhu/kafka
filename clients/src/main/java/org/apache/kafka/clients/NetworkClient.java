@@ -393,6 +393,7 @@ public class NetworkClient implements KafkaClient {
                         header.apiVersion(), clientRequest.apiKey(), request, clientRequest.correlationId(), nodeId);
             }
         }
+        // 封装成NetworkSend, Request的header是唯一发送的内容
         Send send = request.toSend(nodeId, header);
         InFlightRequest inFlightRequest = new InFlightRequest(
                 header,
@@ -404,7 +405,9 @@ public class NetworkClient implements KafkaClient {
                 request,
                 send,
                 now);
+        // 将请求添加到inflight
         this.inFlightRequests.add(inFlightRequest);
+        // 发送send对象(准确的说应该是添加到队列)
         selector.send(inFlightRequest.send);
     }
 
@@ -439,6 +442,7 @@ public class NetworkClient implements KafkaClient {
         long updatedNow = this.time.milliseconds();
         List<ClientResponse> responses = new ArrayList<>();
         handleCompletedSends(responses, updatedNow);
+        // metadata的更新也在这里处理
         handleCompletedReceives(responses, updatedNow);
         handleDisconnections(responses, updatedNow);
         handleConnections();
@@ -511,25 +515,36 @@ public class NetworkClient implements KafkaClient {
      * prefer a node with an existing connection, but will potentially choose a node for which we don't yet have a
      * connection if all existing connections are in use. This method will never choose a node for which there is no
      * existing connection and from which we have disconnected within the reconnect backoff period.
+     * 寻找合适的broker, 合适的定义为:
+     * 1. 当存在已经建立连接的node时, 优先从中选择空闲的
+     * 2. 当所有已经建立连接的node均不空闲, 优先创建新的
+     * 3. 绝不会选择reconnect backoff period中断开连接的node
      *
      * @return The node with the fewest in-flight requests.
      */
     @Override
     public Node leastLoadedNode(long now) {
+        // 获取metadata中记录的所有node列表
         List<Node> nodes = this.metadataUpdater.fetchNodes();
         int inflight = Integer.MAX_VALUE;
         Node found = null;
 
+        // 随机从nodes中选一个开始遍历(for 负载均衡)
         int offset = this.randOffset.nextInt(nodes.size());
         for (int i = 0; i < nodes.size(); i++) {
             int idx = (offset + i) % nodes.size();
             Node node = nodes.get(idx);
+            // 统计inFlight状态的request有多少属于这个node
             int currInflight = this.inFlightRequests.count(node.idString());
+            // node空闲, 并且已经建立连接(isReady) 直接返回
             if (currInflight == 0 && isReady(node, now)) {
                 // if we find an established connection with no in-flight requests we can stop right away
                 log.trace("Found least loaded node {} connected with no in-flight requests", node);
                 return node;
-            } else if (!this.connectionStates.isBlackedOut(node.idString(), now) && currInflight < inflight) {
+            }
+            // node没有被标记为不可用(!isBlackedOut), 遍历选出inflight数量最小的, 即
+            // 最空闲
+            else if (!this.connectionStates.isBlackedOut(node.idString(), now) && currInflight < inflight) {
                 // otherwise if this is the best we have found so far, record that
                 inflight = currInflight;
                 found = node;
@@ -539,6 +554,7 @@ public class NetworkClient implements KafkaClient {
             }
         }
 
+        // 选出最空闲的node
         if (found != null)
             log.trace("Found least loaded node {}", found);
         else
@@ -755,6 +771,7 @@ public class NetworkClient implements KafkaClient {
 
     /**
      * Initiate a connection to the given node
+     * 创建指向node(broker)的连接
      */
     private void initiateConnect(Node node, long now) {
         String nodeConnectionId = node.idString();
@@ -800,9 +817,15 @@ public class NetworkClient implements KafkaClient {
         @Override
         public long maybeUpdate(long now) {
             // should we update our metadata?
+            // 距离下一次更新metadata需要等待的时间
             long timeToNextMetadataUpdate = metadata.timeToNextUpdate(now);
+            // 如果已经有metadata更新请求发送, 正等待返回, 这里直接等待返回即可
             long waitForMetadataFetch = this.metadataFetchInProgress ? requestTimeoutMs : 0;
 
+            // waitForMetadataFetch>0, 表示已经有inflight的更新请求, 那么下一次更新
+            // 需要最起码等到此次请求timeout
+            // timeToNextMetadataUpdate>0, 表示上一次更新刚结束不久, 需要等待下一次
+            // 这里取两者中的最大值, 则是整体需要等待下一次更新的时间
             long metadataTimeout = Math.max(timeToNextMetadataUpdate, waitForMetadataFetch);
             if (metadataTimeout > 0) {
                 return metadataTimeout;
@@ -810,12 +833,14 @@ public class NetworkClient implements KafkaClient {
 
             // Beware that the behavior of this method and the computation of timeouts for poll() are
             // highly dependent on the behavior of leastLoadedNode.
+            // 筛选出当前最空闲的broker
             Node node = leastLoadedNode(now);
             if (node == null) {
                 log.debug("Give up sending metadata request since no node is available");
                 return reconnectBackoffMs;
             }
 
+            // 向空闲broker发送MetadataUpdateRequest请求(准确的说是添加到发送队列)
             return maybeUpdate(now, node);
         }
 
@@ -836,6 +861,12 @@ public class NetworkClient implements KafkaClient {
             metadataFetchInProgress = false;
         }
 
+        /**
+         * 处理中更新metadata请求的响应, 更新metadata
+         * @param requestHeader
+         * @param now
+         * @param response
+         */
         @Override
         public void handleCompletedMetadataResponse(RequestHeader requestHeader, long now, MetadataResponse response) {
             this.metadataFetchInProgress = false;
@@ -874,11 +905,13 @@ public class NetworkClient implements KafkaClient {
 
         /**
          * Add a metadata request to the list of sends if we can make one
+         * 尝试添加MetadataUpdateRequest到发送缓存, 或者在指定node未就绪的时候准备node
          */
         private long maybeUpdate(long now, Node node) {
             String nodeConnectionId = node.idString();
 
             if (canSendRequest(nodeConnectionId)) {
+                // 处于连接状态, 可以直接发送请求
                 this.metadataFetchInProgress = true;
                 MetadataRequest.Builder metadataRequest;
                 if (metadata.needMetadataForAllTopics())
@@ -905,6 +938,7 @@ public class NetworkClient implements KafkaClient {
             if (connectionStates.canConnect(nodeConnectionId, now)) {
                 // we don't have a connection to this node right now, make one
                 log.debug("Initialize connection to node {} for sending metadata request", node);
+                // 未曾连接, 新建连接
                 initiateConnect(node, now);
                 return reconnectBackoffMs;
             }

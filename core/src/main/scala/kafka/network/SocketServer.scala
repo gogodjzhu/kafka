@@ -48,10 +48,17 @@ import scala.util.control.{ControlThrowable, NonFatal}
  *   1 Acceptor thread that handles new connections
  *   Acceptor has N Processor threads that each have their own selector and read requests from sockets
  *   M Handler threads that handle requests and produce responses back to the processor threads for writing.
+ *
+ * << 1-N-M模型 >>
+ * 1个Acceptor监听线程，负责监听新的socket连接
+ * N个IO线程，负责对socket进行读写，N一般等于cpu的核数
+ * M个worker线程，负责处理数据
+ *
  */
 class SocketServer(val config: KafkaConfig, val metrics: Metrics, val time: Time, val credentialProvider: CredentialProvider) extends Logging with KafkaMetricsGroup {
 
   private val endpoints = config.listeners.map(l => l.listenerName -> l).toMap
+  // IO线程数, 即1-N-M模型中的N
   private val numProcessorThreads = config.numNetworkThreads
   private val maxQueuedRequests = config.queuedMaxRequests
   private val totalProcessorThreads = numProcessorThreads * endpoints.size
@@ -64,6 +71,7 @@ class SocketServer(val config: KafkaConfig, val metrics: Metrics, val time: Time
   val requestChannel = new RequestChannel(totalProcessorThreads, maxQueuedRequests)
   private val processors = new Array[Processor](totalProcessorThreads)
 
+  // private[包名] 此语法意为当前参数在指定包内可见
   private[network] val acceptors = mutable.Map[EndPoint, Acceptor]()
   private var connectionQuotas: ConnectionQuotas = _
 
@@ -367,6 +375,8 @@ private[kafka] class Acceptor(val endPoint: EndPoint,
 /**
  * Thread that processes all requests from a single connection. There are N of these running in parallel
  * each of which has its own selector
+ *
+ * 1-N-M模型中的N, 负责处理IO, 每个Processor都有一个自己的{@}
  */
 private[kafka] class Processor(val id: Int,
                                time: Time,

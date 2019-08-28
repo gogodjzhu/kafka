@@ -21,6 +21,8 @@ import java.nio.channels.ScatteringByteChannel;
 
 /**
  * This interface models the in-progress reading of data from a channel to a source identified by an integer id
+ *
+ * 定向从某个channel获取数据的抽象
  */
 public interface Receive {
 

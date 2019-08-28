@@ -150,6 +150,10 @@ public class KafkaChannel {
         return socket.getInetAddress().toString();
     }
 
+    /**
+     * 添加到发送缓存, 如果当前有正在处理的发送请求, 抛出异常
+     * @param send
+     */
     public void setSend(Send send) {
         if (this.send != null)
             throw new IllegalStateException("Attempt to begin a send operation with prior send operation still in progress, connection id is " + id);
@@ -157,6 +161,12 @@ public class KafkaChannel {
         this.transportLayer.addInterestOps(SelectionKey.OP_WRITE);
     }
 
+    /**
+     * 接收消息, 并将其封装成NetworkReceive
+     * @return receive.complete()=true, 即读满一个receive的buffer时返回Receive, 否
+     * 则返回null
+     * @throws IOException
+     */
     public NetworkReceive read() throws IOException {
         NetworkReceive result = null;
 
@@ -173,6 +183,12 @@ public class KafkaChannel {
         return result;
     }
 
+    /**
+     * 将{@link this#send}中封装的消息发送出去, send可能将报文分批发送, 通过
+     * {@link Send#completed()} 来判断是否发送完成
+     * @return 成功执行了发送操作返回执行操作的send对象, 否则返回null
+     * @throws IOException
+     */
     public Send write() throws IOException {
         Send result = null;
         if (send != null && send(send)) {
@@ -204,8 +220,10 @@ public class KafkaChannel {
     }
 
     private boolean send(Send send) throws IOException {
+        // 将send中封装的数据发送到transportLayer(channel), send内部维护发送进度
         send.writeTo(transportLayer);
         if (send.completed())
+            // send发送完毕, 移除transportLayer(key)对write事件的监听
             transportLayer.removeInterestOps(SelectionKey.OP_WRITE);
 
         return send.completed();

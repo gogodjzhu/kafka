@@ -193,6 +193,7 @@ public class Sender implements Runnable {
 
     /**
      * Run a single iteration of sending
+     * 一次完整的发送+响应流程
      *
      * @param now The current POSIX time in milliseconds
      */

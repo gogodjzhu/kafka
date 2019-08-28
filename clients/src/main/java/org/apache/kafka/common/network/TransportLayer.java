@@ -31,7 +31,11 @@ import java.nio.channels.GatheringByteChannel;
 
 import java.security.Principal;
 
-
+/**
+ * Kafka自己封装的增强NIO Channel实现
+ * ScatteringByteChannel接口定义了往多个Buffer分发的方法
+ * GatheringByteChannel接口定义了从多个Buffer读数据到当前channel的方法
+ */
 public interface TransportLayer extends ScatteringByteChannel, GatheringByteChannel {
 
     /**

@@ -26,6 +26,7 @@ import java.util.Map;
 
 /**
  * The set of requests which have been sent or are being sent but haven't yet received a response
+ * 本质是一个map, 用以保存已经发送, 等待返回的inflight请求, 按照brokerId组织成map
  */
 final class InFlightRequests {
 

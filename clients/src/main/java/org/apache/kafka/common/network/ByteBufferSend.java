@@ -23,6 +23,11 @@ import java.nio.channels.GatheringByteChannel;
 
 /**
  * A send backed by an array of byte buffers
+ * 基于ByteBuffer[]实现的Send, 可以将buffers分批写入channel. 多个Buffer合并发送, 底层
+ * 调用{@link GatheringByteChannel#write(ByteBuffer[])}.
+ *
+ * 对于SocketChannel最终底层调用的是{@link java.nio.channels.SocketChannel#write(ByteBuffer[], int, int)},
+ * 该方法返回每次写入成功的字节数, 基于此来判断完成状态
  */
 public class ByteBufferSend implements Send {
 

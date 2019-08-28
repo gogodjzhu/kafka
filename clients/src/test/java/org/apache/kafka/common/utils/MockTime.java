@@ -82,4 +82,9 @@ public class MockTime implements Time {
 
         highResTimeNs.set(TimeUnit.MILLISECONDS.toNanos(newMs));
     }
+
+    public static void main(String [] args) {
+        MockTime mockTime = new MockTime();
+        mockTime.sleep(3000);
+    }
 }

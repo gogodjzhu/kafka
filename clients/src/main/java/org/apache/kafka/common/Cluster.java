@@ -30,13 +30,17 @@ import java.util.Set;
 
 /**
  * A representation of a subset of the nodes, topics, and partitions in the Kafka cluster.
+ * 维护集群中broker节点/topic/partitionInfo等的信息
  */
 public final class Cluster {
 
     private final boolean isBootstrapConfigured;
+    // node即broker
     private final List<Node> nodes;
+    // 无权限获取meta信息的topic
     private final Set<String> unauthorizedTopics;
     private final Set<String> internalTopics;
+    // KafkaController所在的broker
     private final Node controller;
     private final Map<TopicPartition, PartitionInfo> partitionsByTopicPartition;
     private final Map<String, List<PartitionInfo>> partitionsByTopic;

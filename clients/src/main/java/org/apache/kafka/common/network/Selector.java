@@ -86,6 +86,7 @@ public class Selector implements Selectable, AutoCloseable {
     private static final Logger log = LoggerFactory.getLogger(Selector.class);
 
     private final java.nio.channels.Selector nioSelector;
+    // Selector 内部维护的channel池
     private final Map<String, KafkaChannel> channels;
     private final List<Send> completedSends;
     private final List<NetworkReceive> completedReceives;
@@ -100,10 +101,13 @@ public class Selector implements Selectable, AutoCloseable {
     private final ChannelBuilder channelBuilder;
     private final int maxReceiveSize;
     private final boolean recordTimePerConnection;
+    // channel长时间无消息管理
     private final IdleExpiryManager idleExpiryManager;
 
     /**
      * Create a new nioSelector
+     *
+     * 构造nio的Selector对象作为全局属性, 等待其余方法注册
      *
      * @param maxReceiveSize Max size in bytes of a single network receive (use {@link NetworkReceive#UNLIMITED} for no limit)
      * @param connectionMaxIdleMs Max idle connection time (use {@link #NO_IDLE_TIMEOUT_MS} to disable idle timeout)
@@ -172,14 +176,21 @@ public class Selector implements Selectable, AutoCloseable {
      * @param receiveBufferSize The receive buffer for the new connection
      * @throws IllegalStateException if there is already a connection for that id
      * @throws IOException if DNS resolution fails on the hostname or if the broker is down
+     *
+     * 作为客户端创建连接到address,
+     * 对Java NIO不熟悉可以参考: http://www.gogodjzhu.com/201906/java-nio-helloworld/
+     *
      */
     @Override
     public void connect(String id, InetSocketAddress address, int sendBufferSize, int receiveBufferSize) throws IOException {
         if (this.channels.containsKey(id))
             throw new IllegalStateException("There is already a connection for id " + id);
 
+        // 创建一个nio的SocketChannel实例
         SocketChannel socketChannel = SocketChannel.open();
+        // 非阻塞模式(非阻塞模式 vs 异步模式)
         socketChannel.configureBlocking(false);
+        // 创建Socket并配置相关属性
         Socket socket = socketChannel.socket();
         socket.setKeepAlive(true);
         if (sendBufferSize != Selectable.USE_DEFAULT_BUFFER_SIZE)
@@ -189,6 +200,7 @@ public class Selector implements Selectable, AutoCloseable {
         socket.setTcpNoDelay(true);
         boolean connected;
         try {
+            // 由于channel使用了非阻塞模式, 方法返回时连接可能完成也可能没有.
             connected = socketChannel.connect(address);
         } catch (UnresolvedAddressException e) {
             socketChannel.close();
@@ -197,9 +209,11 @@ public class Selector implements Selectable, AutoCloseable {
             socketChannel.close();
             throw e;
         }
+        // 注册监听连接完成事件, 并返回对应的key
         SelectionKey key = socketChannel.register(nioSelector, SelectionKey.OP_CONNECT);
         KafkaChannel channel;
         try {
+            // 使用SelectionKey构建kafka自己构建的KafkaChannel
             channel = channelBuilder.buildChannel(id, key, maxReceiveSize);
         } catch (Exception e) {
             try {
@@ -209,9 +223,14 @@ public class Selector implements Selectable, AutoCloseable {
             }
             throw new IOException("Channel could not be created for socket " + socketChannel, e);
         }
+        // 将当前kafkaChannel绑定(attach)到key, 监听到key注册事件时可以通过attachment
+        // 方法获取来源channel
         key.attach(channel);
+        // 将创建的连接保存到map
         this.channels.put(id, channel);
 
+        // 前面提到非阻塞模式可能已经完成了连接建立, 可能没有. 如果已经建立, 则将事件key
+        // 添加到immediatelyConnectedKeys, 并同时清空key监听的事件
         if (connected) {
             // OP_CONNECT won't trigger for immediately connected channels
             log.debug("Immediately connected to node {}", channel.id());
@@ -263,13 +282,18 @@ public class Selector implements Selectable, AutoCloseable {
      */
     public void send(Send send) {
         String connectionId = send.destination();
+        // 指定channel已关闭, 则将channelId添加到failedSends
         if (closingChannels.containsKey(connectionId))
             this.failedSends.add(connectionId);
         else {
+            // 根据id获取未关闭的的channel
             KafkaChannel channel = channelOrFail(connectionId, false);
             try {
+                // 将发送请求添加到channel的缓存等待发送
                 channel.setSend(send);
-            } catch (Exception e) {
+            }
+            // 任何异常均会导致channel关闭
+            catch (Exception e) {
                 // update the state for consistency, the channel will be discarded after `close`
                 channel.state(ChannelState.FAILED_SEND);
                 // ensure notification via `disconnected` when `failedSends` are processed in the next poll
@@ -309,6 +333,14 @@ public class Selector implements Selectable, AutoCloseable {
      * by SocketServer to the request queue may be processed by different request handler threads, requests on each
      * channel must be processed one-at-a-time to guarantee ordering.
      *
+     * 所有的IO操作都是非阻塞的, 包括connect/disconnect/send/receive, 在调用了这些非
+     * 阻塞方法之后, 需要调用poll来等待新事件发生.
+     *
+     * 新发生的事件会被封装成Receive, 添加到全局的集合中.
+     *
+     * 本方法不会返回是否有新的Receive产生, 在调用了本方法之后需要调用者自行到集合中判断
+     * 并获取自己关注的Receive
+     *
      * @param timeout The amount of time to wait, in milliseconds, which must be non-negative
      * @throws IllegalArgumentException If `timeout` is negative
      * @throws IllegalStateException If a send is given for which we have no existing connection or for which there is
@@ -319,19 +351,28 @@ public class Selector implements Selectable, AutoCloseable {
         if (timeout < 0)
             throw new IllegalArgumentException("timeout should be >= 0");
 
+        // 清空事件缓存, 这样在集合中获取到的事件都是上一次poll之后发生的
         clear();
 
+        // hasStagedReceives=true 表示有的数据包尚未发送完成, 他们暂存在stagedReceives
+        // 中. 所以可以预计马上会有新的剩余数据到来. 所以将timeout设为0.
+        // immediatelyConnectedKeys保存的是那些在建立连接时当即完成的key, 他们不会有新
+        // 的connect时间发生, 需要特殊处理, 将这些channel初始化. 所以也将timeout设为0
         if (hasStagedReceives() || !immediatelyConnectedKeys.isEmpty())
-            timeout = 0;
+            timeout = 0; // select等待新事件到来的时间
 
         /* check ready keys */
         long startSelect = time.nanoseconds();
+        // 调用nioSelector的select方法, 等待新事件的发生
         int readyKeys = select(timeout);
         long endSelect = time.nanoseconds();
         this.sensors.selectTime.record(endSelect - startSelect, time.milliseconds());
 
         if (readyKeys > 0 || !immediatelyConnectedKeys.isEmpty()) {
+            // 处理新事件
             pollSelectionKeys(this.nioSelector.selectedKeys(), false, endSelect);
+            // 处理immediatelyConnected Channel的初始化, 注意第二个参数为true以区分
+            // 普通事件
             pollSelectionKeys(immediatelyConnectedKeys, true, endSelect);
         }
 
@@ -340,6 +381,7 @@ public class Selector implements Selectable, AutoCloseable {
 
         // we use the time at the end of select to ensure that we don't close any connections that
         // have just been processed in pollSelectionKeys
+        // 关闭过长时间未接收到消息的channel
         maybeCloseOldestConnection(endSelect);
 
         // Add to completedReceives after closing expired connections to avoid removing
@@ -347,6 +389,13 @@ public class Selector implements Selectable, AutoCloseable {
         addToCompletedReceives();
     }
 
+    /**
+     * 处理新事件
+     * @param selectionKeys 事件对应key
+     * @param isImmediatelyConnected 标记是否为isImmediatelyConnected channel, 为
+     *                               true时需要做channel初始化工作
+     * @param currentTimeNanos 调用时间, 用以监控
+     */
     void pollSelectionKeys(Iterable<SelectionKey> selectionKeys,
                                    boolean isImmediatelyConnected,
                                    long currentTimeNanos) {
@@ -359,6 +408,7 @@ public class Selector implements Selectable, AutoCloseable {
 
             // register all per-connection metrics at once
             sensors.maybeRegisterConnectionMetrics(channel.id());
+            // 更新channel最后接收消息的时间
             if (idleExpiryManager != null)
                 idleExpiryManager.update(channel.id(), currentTimeNanos);
 
@@ -366,7 +416,13 @@ public class Selector implements Selectable, AutoCloseable {
             try {
 
                 /* complete any connections that have finished their handshake (either normally or immediately) */
+                // isImmediatelyConnected表示此channel在connect阶段已经完成了连接建立,
+                // key.isConnectable表示key对应的连接已建立.
+                // 两种情况都需要调用finishConnect()方法并将channelId添加到集合, 调用
+                // 者据此来判断连接建立与否
                 if (isImmediatelyConnected || key.isConnectable()) {
+                    // 完成连接建立, 并更新key关注的事件(添加read, 移除connect), 同时
+                    // 更新channel state(如果未启用鉴权, 则已经完整完成连接建立)
                     if (channel.finishConnect()) {
                         this.connected.add(channel.id());
                         this.sensors.connectionCreated.record();
@@ -381,31 +437,50 @@ public class Selector implements Selectable, AutoCloseable {
                 }
 
                 /* if channel is not ready finish prepare */
+                // 做channel初始化工作, 包括握手鉴权
                 if (channel.isConnected() && !channel.ready())
                     channel.prepare();
 
                 /* if channel is ready read from any connections that have readable data */
+                /**
+                 * 可读事件, 处理读操作
+                 * stage n. 阶段；舞台；戏剧；驿站
+                 * 在这里解释为暂存, 由于单个Receiver可能无法一次完成发送, 故设计了
+                 * {@link this#stagedReceives}, 这里只负责将stageReceive不断添加到
+                 * map
+                 **/
                 if (channel.ready() && key.isReadable() && !hasStagedReceive(channel)) {
                     NetworkReceive networkReceive;
+                    // 读取时, channel(KafkaChannel)内部维护了一个全局的networkReceive
+                    // 它有固定大小的buffer, 会在buffer满的时候返回receive
                     while ((networkReceive = channel.read()) != null)
                         addToStagedReceives(channel, networkReceive);
                 }
 
+                /**
+                 * 可写事件, 处理写操作
+                 * 每次调用write方法可能只发送send中的部分, 发送进度在send内部维护.
+                 * 通过{@link Send#completed()}方法判断Send是否完整完成
+                 */
                 /* if channel is ready write to any sockets that have space in their buffer and for which we have data */
                 if (channel.ready() && key.isWritable()) {
                     Send send = null;
                     try {
+                        //成功执行了发送操作返回执行操作的send对象, 否则返回null
                         send = channel.write();
                     } catch (Exception e) {
                         sendFailed = true;
                         throw e;
                     }
                     if (send != null) {
+                        // 注意这里的completedSends并不代表Send已经完整发送, 需要通过
+                        // completed方法判断
                         this.completedSends.add(send);
                         this.sensors.recordBytesSent(channel.id(), send.size());
                     }
                 }
 
+                // key不可用, 关闭channel
                 /* cancel any defunct sockets */
                 if (!key.isValid())
                     close(channel, true, true);
@@ -449,6 +524,12 @@ public class Selector implements Selectable, AutoCloseable {
         return this.connected;
     }
 
+    /***************************************************************************/
+    /**   下面几个mute方法提供了消息有序性的保证,接受到一个request，就会mute该       */
+    /** channel，不再接收新请求；等到该请求处理完毕，response返回之后，再unmute该通道 */
+    /** 接收下1个请求。                                                          */
+    /***************************************************************************/
+
     @Override
     public void mute(String id) {
         KafkaChannel channel = channelOrFail(id, true);
@@ -481,6 +562,10 @@ public class Selector implements Selectable, AutoCloseable {
             unmute(channel);
     }
 
+    /**
+     * 关闭过长时间未收到消息的channel
+     * @param currentTimeNanos
+     */
     private void maybeCloseOldestConnection(long currentTimeNanos) {
         if (idleExpiryManager == null)
             return;
@@ -624,6 +709,12 @@ public class Selector implements Selectable, AutoCloseable {
         return channel != null && channel.ready();
     }
 
+    /**
+     * 获取指定id的channel
+     * @param id channelId
+     * @param maybeClosing 为true时可以返回已关闭的channel
+     * @return 返回channel, 找不到或maybeClosing为false时找到关闭的channel, 抛出异常
+     */
     private KafkaChannel channelOrFail(String id, boolean maybeClosing) {
         KafkaChannel channel = this.channels.get(id);
         if (channel == null && maybeClosing)

@@ -64,21 +64,31 @@ import java.util.concurrent.atomic.AtomicInteger;
  * <p>
  * The accumulator uses a bounded amount of memory and append calls will block when that memory is exhausted, unless
  * this behavior is explicitly disabled.
+ *
+ * 消息发送队列, 队列满则阻塞写入(可显式关闭阻塞)
  */
 public final class RecordAccumulator {
 
     private static final Logger log = LoggerFactory.getLogger(RecordAccumulator.class);
 
+    // 关闭打开状态
     private volatile boolean closed;
+    // 正在调用flush方法的线程数
     private final AtomicInteger flushesInProgress;
+    // 正在调用append方法的线程数
     private final AtomicInteger appendsInProgress;
+
+    // 缓存池大小
     private final int batchSize;
+    // 压缩类型
     private final CompressionType compression;
+    // 缓存等待时间
     private final long lingerMs;
     private final long retryBackoffMs;
     private final BufferPool free;
     private final Time time;
     private final ApiVersions apiVersions;
+    // 针对每个topic-partition维护一个batch队列
     private final ConcurrentMap<TopicPartition, Deque<ProducerBatch>> batches;
     private final IncompleteBatches incomplete;
     // The following variables are only accessed by the sender thread, so we don't need to protect them.
@@ -184,6 +194,7 @@ public final class RecordAccumulator {
                                      long maxTimeToBlock) throws InterruptedException {
         // We keep track of the number of appending thread to make sure we do not miss batches in
         // abortIncompleteBatches().
+        // 记录正在调用append方法的线程数, 记录此数值以处理防止数据丢失 KNOWLEDGE how?
         appendsInProgress.incrementAndGet();
         ByteBuffer buffer = null;
         if (headers == null) headers = Record.EMPTY_HEADERS;
@@ -195,19 +206,25 @@ public final class RecordAccumulator {
                     throw new IllegalStateException("Cannot send after the producer is closed.");
                 RecordAppendResult appendResult = tryAppend(timestamp, key, value, headers, callback, dq);
                 if (appendResult != null)
+                    // 返回非空, 表示插入到已有batch成功
                     return appendResult;
             }
 
             // we don't have an in-progress record batch try to allocate a new batch
+            // 插入已有batch的尝试失败, 开始创建新的batch
             byte maxUsableMagic = apiVersions.maxUsableProduceMagic();
+            // 新batch的大小, 取batchSize配置 和 本消息大小的大值, 保证至少本条消息可以写入batch
             int size = Math.max(this.batchSize, AbstractRecords.estimateSizeInBytesUpperBound(maxUsableMagic, compression, key, value, headers));
             log.trace("Allocating a new {} byte message buffer for topic {} partition {}", size, tp.topic(), tp.partition());
+            // 分配内存, 阻塞maxTimeToBlock时间
             buffer = free.allocate(size, maxTimeToBlock);
             synchronized (dq) {
                 // Need to check if producer is closed again after grabbing the dequeue lock.
                 if (closed)
                     throw new IllegalStateException("Cannot send after the producer is closed.");
 
+                // 在上面创建内存的过程中(因为其未加锁), 其余线程创建了一个可用batch, 我们直接使用它即可(但是这样会导致分配了一份内存又不使用，浪费。
+                // 幸好此情况不常发生，否则非常影响性能)
                 RecordAppendResult appendResult = tryAppend(timestamp, key, value, headers, callback, dq);
                 if (appendResult != null) {
                     // Somebody else found us a batch, return the one we waited for! Hopefully this doesn't happen often...
@@ -222,11 +239,15 @@ public final class RecordAccumulator {
                 incomplete.add(batch);
 
                 // Don't deallocate this buffer in the finally block as it's being used in the record batch
+                // 本次申请的buffer已经使用, 将其置为null防止finally中将其回收
                 buffer = null;
 
-                return new RecordAppendResult(future, dq.size() > 1 || batch.isFull(), true);
+                return new RecordAppendResult(future,
+                        dq.size() > 1 || batch.isFull(), // batch满溢标记, 
+                        true);
             }
         } finally {
+            // 本次新申请的buffer, 如果不为空表示创建了未使用, 将其回收
             if (buffer != null)
                 free.deallocate(buffer);
             appendsInProgress.decrementAndGet();
@@ -248,10 +269,14 @@ public final class RecordAccumulator {
      *  resources like compression buffers. The batch will be fully closed (ie. the record batch headers will be written
      *  and memory records built) in one of the following cases (whichever comes first): right before send,
      *  if it is expired, or when the producer is closed.
+     *
+     *  将消息添加到ProducerBatch中
      */
     private RecordAppendResult tryAppend(long timestamp, byte[] key, byte[] value, Header[] headers, Callback callback, Deque<ProducerBatch> deque) {
+        // 从batch队列队尾拉取一个Batch进行插入
         ProducerBatch last = deque.peekLast();
         if (last != null) {
+            //  消息添加到batch成功返回消息的元数据, 返回null表示此batch已满
             FutureRecordMetadata future = last.tryAppend(timestamp, key, value, headers, callback, time.milliseconds());
             if (future == null)
                 last.closeForRecordAppends();

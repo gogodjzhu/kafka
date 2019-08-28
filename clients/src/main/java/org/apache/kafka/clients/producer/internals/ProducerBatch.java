@@ -51,6 +51,8 @@ import static org.apache.kafka.common.record.RecordBatch.NO_TIMESTAMP;
  * A batch of records that is or will be sent.
  *
  * This class is not thread safe and external synchronization must be used when modifying it
+ *
+ * 消息缓存集,  非线程安全
  */
 public final class ProducerBatch {
 
@@ -98,6 +100,7 @@ public final class ProducerBatch {
      * Append the record to the current record set and return the relative offset within that record set
      *
      * @return The RecordSend corresponding to this record or null if there isn't sufficient room.
+     * 将消息添加到本消息集中,  若集合已满，返回null; 否则返回此消息在本集合中的元数据{@link FutureRecordMetadata}
      */
     public FutureRecordMetadata tryAppend(long timestamp, byte[] key, byte[] value, Header[] headers, Callback callback, long now) {
         if (!recordsBuilder.hasRoomFor(timestamp, key, value, headers)) {
@@ -113,6 +116,9 @@ public final class ProducerBatch {
                                                                    value == null ? -1 : value.length);
             // we have to keep every future returned to the users in case the batch needs to be
             // split to several new batches and resent.
+            // thunk [θʌŋk] n.形实转换程序
+            // thunks保存了本Batch发送过的所有消息的元数据, 以处理batch需要重发、分裂等操作
+            // KNOWLEDGE batch重发&分裂操作?
             thunks.add(new Thunk(callback, future));
             this.recordCount++;
             return future;

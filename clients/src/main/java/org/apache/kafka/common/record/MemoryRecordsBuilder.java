@@ -35,17 +35,25 @@ import static org.apache.kafka.common.utils.Utils.wrapNullable;
  * In cases where keeping memory retention low is important and there's a gap between the time that record appends stop
  * and the builder is closed (e.g. the Producer), it's important to call `closeForRecordAppends` when the former happens.
  * This will release resources like compression buffers that can be relatively large (64 KB for LZ4).
+ *
+ * <br/>
+ * 消息写入到内存对象{@link MemoryRecords}的工具类, 它可以透明地处理压缩和非压缩的Record.
+ *
  */
 public class MemoryRecordsBuilder {
     private static final float COMPRESSION_RATE_ESTIMATION_FACTOR = 1.05f;
 
+    // 消息保存的时间类型, 主要为两种: 消息插入时间, 消息生成时间
     private final TimestampType timestampType;
+    //  压缩类型目前支持4中类型: none, gzip, snappy, lz4
     private final CompressionType compressionType;
     // Used to append records, may compress data on the fly
+    // 通过bufferStream封装而来. 对于压缩数据的场景会对bufferStream进行封装, 得到输出压缩格式的输出流
     private final DataOutputStream appendStream;
     // Used to hold a reference to the underlying ByteBuffer so that we can write the record batch header and access
     // the written bytes. ByteBufferOutputStream allocates a new ByteBuffer if the existing one is not large enough,
     // so it's not safe to hold a direct reference to the underlying ByteBuffer.
+    // 直接操作ByteBuffer缓存的流
     private final ByteBufferOutputStream bufferStream;
     private final byte magic;
     private final int initialPosition;
