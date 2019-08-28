@@ -525,7 +525,7 @@ public class NetworkClient implements KafkaClient {
      * prefer a node with an existing connection, but will potentially choose a node for which we don't yet have a
      * connection if all existing connections are in use. This method will never choose a node for which there is no
      * existing connection and from which we have disconnected within the reconnect backoff period.
-     * 寻找合适的broker, 合适的定义为:
+     * 寻找最不繁忙的的broker, 不繁忙的定义为:
      * 1. 当存在已经建立连接的node时, 优先从中选择空闲的
      * 2. 当所有已经建立连接的node均不空闲, 优先创建新的
      * 3. 绝不会选择reconnect backoff period中断开连接的node
