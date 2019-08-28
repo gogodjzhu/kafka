@@ -43,6 +43,7 @@ import org.slf4j.LoggerFactory;
 import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
+import java.nio.channels.Selector;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.Iterator;
@@ -413,6 +414,10 @@ public class NetworkClient implements KafkaClient {
 
     /**
      * Do actual reads and writes to sockets.
+     * Sender线程运行中反复调用此方法, 底层调用的是{@link Selector#select()}等待新的nio
+     * 事件发生.
+     * 有新事件发生时, {@link org.apache.kafka.common.network.Selector#pollSelectionKeys(Iterable, boolean, long)}
+     * 方法会将其封装成事件集合, 本方法就可以直接从这些集合中获取自己感兴趣的事件来处理
      *
      * @param timeout The maximum amount of time to wait (in ms) for responses if there are none immediately,
      *                must be non-negative. The actual timeout will be the minimum of timeout, request timeout and
