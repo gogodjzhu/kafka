@@ -436,6 +436,11 @@ public class NetworkClient implements KafkaClient {
             return responses;
         }
 
+        /**
+         * 如果需要更新metadata的话, 更新它. {@link DefaultMetadataUpdater} 实现了
+         * 发送{@link MetadataRequest}请求
+         *
+         */
         long metadataTimeout = metadataUpdater.maybeUpdate(now);
         try {
             this.selector.poll(Utils.min(timeout, metadataTimeout, requestTimeoutMs));
