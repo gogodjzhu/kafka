@@ -30,6 +30,10 @@ import java.util.Map;
  */
 final class InFlightRequests {
 
+    /**
+     * 最多可以接受的待响应的请求数
+     * 1. 对于Producer，配置为{@link org.apache.kafka.clients.producer.ProducerConfig#MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION},
+     */
     private final int maxInFlightRequestsPerConnection;
     private final Map<String, Deque<NetworkClient.InFlightRequest>> requests = new HashMap<>();
 

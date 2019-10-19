@@ -106,6 +106,8 @@ public final class ProducerBatch {
         if (!recordsBuilder.hasRoomFor(timestamp, key, value, headers)) {
             return null;
         } else {
+            // recordsBuilder是用来处理将消息(key/value)写入ByteBuffer的工具类，底层封装了复杂的消息协议（包括粘包/拆包/压缩/版本
+            // 兼容等问题）// NOTE 消息协议细节？
             Long checksum = this.recordsBuilder.append(timestamp, key, value, headers);
             this.maxRecordSize = Math.max(this.maxRecordSize, AbstractRecords.estimateSizeInBytesUpperBound(magic(),
                     recordsBuilder.compressionType(), key, value, headers));

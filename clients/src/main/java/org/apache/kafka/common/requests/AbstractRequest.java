@@ -23,6 +23,9 @@ import org.apache.kafka.common.protocol.types.Struct;
 
 import java.nio.ByteBuffer;
 
+/**
+ * kafka消息抽象类
+ */
 public abstract class AbstractRequest extends AbstractRequestResponse {
 
     public static abstract class Builder<T extends AbstractRequest> {
@@ -70,6 +73,12 @@ public abstract class AbstractRequest extends AbstractRequestResponse {
         return version;
     }
 
+    /**
+     * 将请求实体转化为Send对象，最终通过{@link org.apache.kafka.common.network.KafkaChannel#setSend(Send)}调用
+     * @param destination
+     * @param header
+     * @return
+     */
     public Send toSend(String destination, RequestHeader header) {
         return new NetworkSend(destination, serialize(header));
     }
@@ -81,6 +90,9 @@ public abstract class AbstractRequest extends AbstractRequestResponse {
         return serialize(header.toStruct(), toStruct());
     }
 
+    /**
+     * Struct 是自解析的转换框架，可以将对象根据schema封装成字节数组，这个设计使得可以在上层代码不变的情况下更改请求结构体
+     */
     protected abstract Struct toStruct();
 
     public String toString(boolean verbose) {

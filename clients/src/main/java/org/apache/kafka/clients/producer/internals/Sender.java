@@ -152,6 +152,7 @@ public class Sender implements Runnable {
 
     /**
      * The main run loop for the sender thread
+     * Sender线程的核心循环方法, 研究Sender就以这里为入口
      */
     public void run() {
         log.debug("Starting Kafka producer I/O thread.");
@@ -198,6 +199,7 @@ public class Sender implements Runnable {
      * @param now The current POSIX time in milliseconds
      */
     void run(long now) {
+        // 带事务管理的发送
         if (transactionManager != null) {
             if (!transactionManager.isTransactional()) {
                 // this is an idempotent producer, so make sure we have a producer id
@@ -221,6 +223,19 @@ public class Sender implements Runnable {
             }
         }
 
+        /**
+         * 普通不带事务的发送
+         * 下面两个方法分别做了两个事情:
+         * 1. 从accumulator中拉取数据(batch), 放入({@link org.apache.kafka.common.network.KafkaChannel#send})
+         * 2. 调用client的poll方法, 执行发送KafkaChannel#send中的消息
+         *
+         * 大致来说, 结构是:
+         *  1. Sender整理/校验/合并同node数据
+         *  2. NetworkClient报文格式化/版本校验
+         *  3. Selector缓存Map(node -> KafkaChannel)
+         *  4. KafkaChannel维持单个node的连接, 处理消息发送
+         */
+
         long pollTimeout = sendProducerData(now);
         client.poll(pollTimeout, now);
     }
@@ -228,9 +243,12 @@ public class Sender implements Runnable {
     private long sendProducerData(long now) {
         Cluster cluster = metadata.fetch();
         // get the list of partitions with data ready to send
+        // 获取accumulator中存在可发送数据的Node集合
         RecordAccumulator.ReadyCheckResult result = this.accumulator.ready(cluster, now);
 
         // if there are any partitions whose leaders are not known yet, force metadata update
+        // 发送的时候还没有partition的leader信息, 将需要刷新元数据的标志修改为true,
+        // 在实际发送前会做元数据更新
         if (!result.unknownLeaderTopics.isEmpty()) {
             // The set of topics with unknown leader contains topics with leader election pending as well as
             // topics which may have expired. Add the topic again to metadata to ensure it is included
@@ -245,6 +263,7 @@ public class Sender implements Runnable {
         long notReadyTimeout = Long.MAX_VALUE;
         while (iter.hasNext()) {
             Node node = iter.next();
+            // 发送前检查client到目标node的连通性
             if (!this.client.ready(node, now)) {
                 iter.remove();
                 notReadyTimeout = Math.min(notReadyTimeout, this.client.connectionDelay(node, now));
@@ -252,16 +271,19 @@ public class Sender implements Runnable {
         }
 
         // create produce requests
+        // 从accumulator中获取以readNodes为目标的batch(s)
         Map<Integer, List<ProducerBatch>> batches = this.accumulator.drain(cluster, result.readyNodes,
                 this.maxRequestSize, now);
+        // 是否保持Producer发送消息的顺序, 当maxInflight=1时为true
         if (guaranteeMessageOrder) {
-            // Mute all the partitions drained
+            // Mute all the partitions drained // 如果要求消息有序，此次drain涉及的所有partition全部暂停（mute），防止并发乱序
             for (List<ProducerBatch> batchList : batches.values()) {
                 for (ProducerBatch batch : batchList)
                     this.accumulator.mutePartition(batch.topicPartition);
             }
         }
 
+        // accumulator存在超时未处理的记录找出来, 执行超时回调
         List<ProducerBatch> expiredBatches = this.accumulator.expiredBatches(this.requestTimeout, now);
         boolean needsTransactionStateReset = false;
         // Reset the producer id if an expired batch has previously been sent to the broker. Also update the metrics
@@ -297,6 +319,7 @@ public class Sender implements Runnable {
             // otherwise the select time will be the time difference between now and the metadata expiry time;
             pollTimeout = 0;
         }
+        // 发送
         sendProduceRequests(batches, now);
 
         return pollTimeout;
@@ -619,11 +642,13 @@ public class Sender implements Runnable {
 
     /**
      * Create a produce request from the given record batches
+     * 发送指向单个目标Node的batch集合
      */
     private void sendProduceRequest(long now, int destination, short acks, int timeout, List<ProducerBatch> batches) {
         if (batches.isEmpty())
             return;
 
+        // part -> record, 实际上是对batches的重新组合
         Map<TopicPartition, MemoryRecords> produceRecordsByPartition = new HashMap<>(batches.size());
         final Map<TopicPartition, ProducerBatch> recordsByPartition = new HashMap<>(batches.size());
 
@@ -636,6 +661,7 @@ public class Sender implements Runnable {
 
         for (ProducerBatch batch : batches) {
             TopicPartition tp = batch.topicPartition;
+            // 获取batch中保存在ByteBuffer的数据取出
             MemoryRecords records = batch.records();
 
             // down convert if necessary to the minimum magic used. In general, there can be a delay between the time
@@ -647,7 +673,9 @@ public class Sender implements Runnable {
             // which is supporting the new magic version to one which doesn't, then we will need to convert.
             if (!records.hasMatchingMagic(minUsedMagic))
                 records = batch.records().downConvert(minUsedMagic, 0);
+            // 按照TopicPartition 维护MemoryRecords，用于构造ProduceRequest
             produceRecordsByPartition.put(tp, records);
+            // 按照TopicPartition 维护Batch，回调方法会用
             recordsByPartition.put(tp, batch);
         }
 
@@ -655,6 +683,7 @@ public class Sender implements Runnable {
         if (transactionManager != null && transactionManager.isTransactional()) {
             transactionalId = transactionManager.transactionalId();
         }
+        // 使用Builder的主要目的是为了兼容(校验)不同版本的消息格式
         ProduceRequest.Builder requestBuilder = new ProduceRequest.Builder(minUsedMagic, acks, timeout,
                 produceRecordsByPartition, transactionalId);
         RequestCompletionHandler callback = new RequestCompletionHandler() {

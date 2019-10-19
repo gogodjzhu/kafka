@@ -24,6 +24,15 @@ import java.util.List;
 
 /**
  * The interface for {@link NetworkClient}
+ * 直接跟集群通信的客户端抽象
+ * 作为客户端, 它定义了一下几种方法(功能):
+ * 1. 连接状态的维护
+ *    {@link this#ready(Node, long)} - 建立连接
+ *    {@link this#disconnect(String)}, {@link this#close(String)} - 断开连接
+ *    {@link this#isReady(Node, long)},
+ *    {@link this#connectionFailed(Node)}
+ *    {@link this#connectionDelay(Node, long)} - 连接状态的获取
+ *
  */
 public interface KafkaClient extends Closeable {
 

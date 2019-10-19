@@ -804,7 +804,6 @@ public class KafkaProducer<K, V> implements Producer<K, V> {
                 transactionManager.maybeAddPartitionToTransaction(tp);
 
             // 将消息添加到缓存队列中
-            // KNOWLEDGE 缓存队列原理?
             RecordAccumulator.RecordAppendResult result = accumulator.append(tp, timestamp, serializedKey,
                     serializedValue, headers, interceptCallback, remainingWaitMs);
             // 缓存满了则唤醒sender做数据发送

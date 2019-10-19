@@ -445,14 +445,15 @@ public class Selector implements Selectable, AutoCloseable {
                 /**
                  * 可读事件, 处理读操作
                  * stage n. 阶段；舞台；戏剧；驿站
-                 * 在这里解释为暂存, 由于单个Receiver可能无法一次完成发送, 故设计了
+                 * 在这里解释为暂存, 由于单个Receiver可能无法一次完成读取, 故设计了
                  * {@link this#stagedReceives}, 这里只负责将stageReceive不断添加到
                  * map
                  **/
                 if (channel.ready() && key.isReadable() && !hasStagedReceive(channel)) {
                     NetworkReceive networkReceive;
-                    // 读取时, channel(KafkaChannel)内部维护了一个全局的networkReceive
-                    // 它有固定大小的buffer, 会在buffer满的时候返回receive
+                    // 循环从channel中获取数据放入全局缓存
+                    // 这里有一个很重要的设计！！
+                    // Server端会把一个请求的响应一次性全部返回，并且不会跟其余请求的响应粘包
                     while ((networkReceive = channel.read()) != null)
                         addToStagedReceives(channel, networkReceive);
                 }
@@ -466,15 +467,14 @@ public class Selector implements Selectable, AutoCloseable {
                 if (channel.ready() && key.isWritable()) {
                     Send send = null;
                     try {
-                        //成功执行了发送操作返回执行操作的send对象, 否则返回null
+                        // 当channel通过setSend()方法设置了待发送消息后，此方法执行发送操作并返回刚发送的send对象, 否则返回null
                         send = channel.write();
                     } catch (Exception e) {
                         sendFailed = true;
                         throw e;
                     }
                     if (send != null) {
-                        // 注意这里的completedSends并不代表Send已经完整发送, 需要通过
-                        // completed方法判断
+                        // 发送了send数据，将发送过的send对象添加到completedSends
                         this.completedSends.add(send);
                         this.sensors.recordBytesSent(channel.id(), send.size());
                     }

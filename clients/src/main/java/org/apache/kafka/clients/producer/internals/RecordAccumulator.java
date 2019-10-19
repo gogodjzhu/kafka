@@ -78,7 +78,7 @@ public final class RecordAccumulator {
     // 正在调用append方法的线程数
     private final AtomicInteger appendsInProgress;
 
-    // 缓存池大小
+    // 单个batch大小
     private final int batchSize;
     // 压缩类型
     private final CompressionType compression;
@@ -88,6 +88,9 @@ public final class RecordAccumulator {
     private final BufferPool free;
     private final Time time;
     private final ApiVersions apiVersions;
+
+    // Producer的缓存结构为:
+    // ProducerBatch的底层通过ByteBuffer实现, 以protobuf格式编码
     // 针对每个topic-partition维护一个batch队列
     private final ConcurrentMap<TopicPartition, Deque<ProducerBatch>> batches;
     private final IncompleteBatches incomplete;
@@ -177,6 +180,8 @@ public final class RecordAccumulator {
      * The append result will contain the future metadata, and flag for whether the appended batch is full or a new batch is created
      * <p>
      *
+     * 消息缓存落在{@link this#batches}, 针对每个Partition, 单独维护一个队列, 在队列内部存放着若干的batch, 一个batch内可能保存多条消息
+     *
      * @param tp The topic/partition to which this record is being sent
      * @param timestamp The timestamp of the record
      * @param key The key for the record
@@ -212,6 +217,7 @@ public final class RecordAccumulator {
 
             // we don't have an in-progress record batch try to allocate a new batch
             // 插入已有batch的尝试失败, 开始创建新的batch
+
             byte maxUsableMagic = apiVersions.maxUsableProduceMagic();
             // 新batch的大小, 取batchSize配置 和 本消息大小的大值, 保证至少本条消息可以写入batch
             int size = Math.max(this.batchSize, AbstractRecords.estimateSizeInBytesUpperBound(maxUsableMagic, compression, key, value, headers));
@@ -231,6 +237,7 @@ public final class RecordAccumulator {
                     return appendResult;
                 }
 
+                // 创建新batch
                 MemoryRecordsBuilder recordsBuilder = recordsBuilder(buffer, maxUsableMagic);
                 ProducerBatch batch = new ProducerBatch(tp, recordsBuilder, time.milliseconds());
                 FutureRecordMetadata future = Utils.notNull(batch.tryAppend(timestamp, key, value, headers, callback, time.milliseconds()));
@@ -254,6 +261,9 @@ public final class RecordAccumulator {
         }
     }
 
+    /**
+     * 利用已申请下来的ByteBuffer创建针对此Buffer的工具类
+     */
     private MemoryRecordsBuilder recordsBuilder(ByteBuffer buffer, byte maxUsableMagic) {
         if (transactionManager != null && maxUsableMagic < RecordBatch.MAGIC_VALUE_V2) {
             throw new UnsupportedVersionException("Attempting to use idempotence with a broker which does not " +
@@ -338,6 +348,7 @@ public final class RecordAccumulator {
 
     /**
      * Split the big batch that has been rejected and reenqueue the split batches in to the accumulator.
+     * 分裂大batch
      * @return the number of split batches.
      */
     public int splitAndReenqueue(ProducerBatch bigBatch) {
@@ -405,6 +416,7 @@ public final class RecordAccumulator {
                         long timeToWaitMs = backingOff ? retryBackoffMs : lingerMs;
                         boolean full = deque.size() > 1 || batch.isFull();
                         boolean expired = waitedTimeMs >= timeToWaitMs;
+                        // 发送消息的条件是以下任意:
                         boolean sendable = full || expired || exhausted || closed || flushInProgress();
                         if (sendable && !backingOff) {
                             readyNodes.add(leader);
@@ -441,6 +453,8 @@ public final class RecordAccumulator {
      * Drain all the data for the given nodes and collate them into a list of batches that will fit within the specified
      * size on a per-node basis. This method attempts to avoid choosing the same topic-node over and over.
      *
+     * 获取以nodes为目标的records, 必要时会合并发往同一个node不同partition的多个record
+     *
      * @param cluster The current cluster metadata
      * @param nodes The list of node to drain
      * @param maxSize The maximum number of bytes to drain
@@ -457,23 +471,33 @@ public final class RecordAccumulator {
         Map<Integer, List<ProducerBatch>> batches = new HashMap<>();
         for (Node node : nodes) {
             int size = 0;
+            // 当前node下的所有partition信息
             List<PartitionInfo> parts = cluster.partitionsForNode(node.id());
+            // 将要发往当前node的记录集合
             List<ProducerBatch> ready = new ArrayList<>();
             /* to make starvation less likely this loop doesn't start at 0 */
             int start = drainIndex = drainIndex % parts.size();
+
+            // 循环将发往当前node的记录添加到ready集合中
             do {
+                // 其中一个partition, 最终发送多个partition的记录可能落在同一个read集合中
                 PartitionInfo part = parts.get(drainIndex);
                 TopicPartition tp = new TopicPartition(part.topic(), part.partition());
                 // Only proceed if the partition has no in-flight batches.
                 if (!muted.contains(tp)) {
+                    // 从batches获取指向当前partition的消息队列
                     Deque<ProducerBatch> deque = getDeque(tp);
                     if (deque != null) {
                         synchronized (deque) {
-                            ProducerBatch first = deque.peekFirst();
+                            ProducerBatch first = deque.peekFirst(); // peek不移除, poll移除
                             if (first != null) {
+                                // 防止频繁重试, 限制当attempts>0时, 等待间隔时间必须不小于retryBackoffMs
                                 boolean backoff = first.attempts() > 0 && first.waitedTimeMs(now) < retryBackoffMs;
                                 // Only drain the batch if it is not during backoff period.
                                 if (!backoff) {
+                                    // 消息不能超过maxSize, 所以在ready集合总大小size大于maxSize之前跳出循环, ready已经准备好发送
+                                    // 下方作者注释还提到, 有可能单个batch会因为压缩导致体积不减反增超过maxSize, 这时read.isEmpty,
+                                    // 还是继续将这个记录发送
                                     if (size + first.sizeInBytes() > maxSize && !ready.isEmpty()) {
                                         // there is a rare case that a single batch size is larger than the request size due
                                         // to compression; in this case we will still eventually send this batch in a single
@@ -494,7 +518,7 @@ public final class RecordAccumulator {
                                             isTransactional = transactionManager.isTransactional();
                                         }
 
-                                        ProducerBatch batch = deque.pollFirst();
+                                        ProducerBatch batch = deque.pollFirst(); // peek不移除, poll移除
                                         if (producerIdAndEpoch != null && !batch.inRetry()) {
                                             // If the batch is in retry, then we should not change the producer id and
                                             // sequence number, since this may introduce duplicates. In particular,
@@ -507,9 +531,13 @@ public final class RecordAccumulator {
                                                     sequenceNumber, producerIdAndEpoch, batch.topicPartition, node);
                                             batch.setProducerState(producerIdAndEpoch, sequenceNumber, isTransactional);
                                         }
+                                        // 关闭此batch，防止仍有消息写入
                                         batch.close();
+                                        // 统计当前ready集合的总消息大小
                                         size += batch.sizeInBytes();
+                                        // 消息添加到ready集合
                                         ready.add(batch);
+                                        // 更新batch消费时间未当前now(可用于统计消息在队列中缓存的时间)
                                         batch.drained(now);
                                     }
                                 }

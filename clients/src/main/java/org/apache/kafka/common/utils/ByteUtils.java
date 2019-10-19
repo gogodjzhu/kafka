@@ -226,6 +226,8 @@ public final class ByteUtils {
      * Write the given integer following the variable-length zig-zag encoding from
      * <a href="http://code.google.com/apis/protocolbuffers/docs/encoding.html"> Google Protocol Buffers</a>
      * into the output.
+     * 将一个int类型的值按照protobuf编码协议编译成字节流写到out.
+     * 协议相关可以参考: <a href="http://www.gogodjzhu.com/201906/google-protobuf-encoding/">Google Protobuf 编码原理</a>
      *
      * @param value The value to write
      * @param out The output to write to

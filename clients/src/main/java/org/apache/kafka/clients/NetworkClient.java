@@ -381,6 +381,9 @@ public class NetworkClient implements KafkaClient {
         }
     }
 
+    /**
+     * 完成版本校验之后, 调用此方法发送消息
+     */
     private void doSend(ClientRequest clientRequest, boolean isInternalRequest, long now, AbstractRequest request) {
         String nodeId = clientRequest.destination();
         RequestHeader header = clientRequest.makeHeader(request.version());
@@ -394,7 +397,7 @@ public class NetworkClient implements KafkaClient {
                         header.apiVersion(), clientRequest.apiKey(), request, clientRequest.correlationId(), nodeId);
             }
         }
-        // 封装成NetworkSend, Request的header是唯一发送的内容
+        // TODO 封装成NetworkSend, Request的header是唯一发送的内容
         Send send = request.toSend(nodeId, header);
         InFlightRequest inFlightRequest = new InFlightRequest(
                 header,
@@ -417,7 +420,7 @@ public class NetworkClient implements KafkaClient {
      * Sender线程运行中反复调用此方法, 底层调用的是{@link Selector#select()}等待新的nio
      * 事件发生.
      * 有新事件发生时, {@link org.apache.kafka.common.network.Selector#pollSelectionKeys(Iterable, boolean, long)}
-     * 方法会将其封装成事件集合, 本方法就可以直接从这些集合中获取自己感兴趣的事件来处理
+     * 方法会将其封装成事件集合, 之后通过handleXXX方法从这些集合中获取自己感兴趣的事件来处理
      *
      * @param timeout The maximum amount of time to wait (in ms) for responses if there are none immediately,
      *                must be non-negative. The actual timeout will be the minimum of timeout, request timeout and
@@ -451,8 +454,10 @@ public class NetworkClient implements KafkaClient {
         // process completed actions
         long updatedNow = this.time.milliseconds();
         List<ClientResponse> responses = new ArrayList<>();
+        // 处理已发送的消息(准确的说是处理已发送且不期待响应的数据，对于那些有响应的数据会在下面的handleCompletedReceives方法中处理)
         handleCompletedSends(responses, updatedNow);
-        // metadata的更新也在这里处理
+        // 处理读取结果
+        // 主意是所有的响应都在这里处理，包括元数据更新
         handleCompletedReceives(responses, updatedNow);
         handleDisconnections(responses, updatedNow);
         handleConnections();
@@ -630,6 +635,7 @@ public class NetworkClient implements KafkaClient {
     /**
      * Iterate over all the inflight requests and expire any requests that have exceeded the configured requestTimeout.
      * The connection to the node associated with the request will be terminated and will be treated as a disconnection.
+     * 超时请求当作连接断开
      *
      * @param responses The list of responses to update
      * @param now The current time
@@ -655,6 +661,7 @@ public class NetworkClient implements KafkaClient {
 
     /**
      * Handle any completed request send. In particular if no response is expected consider the request complete.
+     * 有已发送的数据，找出不期待响应的请求，从已发送队列中移除。反之则不处理
      *
      * @param responses The list of responses to update
      * @param now The current time
@@ -672,13 +679,19 @@ public class NetworkClient implements KafkaClient {
 
     /**
      * Handle any completed receives and update the response list with the responses received.
+     * 解析返回的响应
      *
      * @param responses The list of responses to update
      * @param now The current time
      */
     private void handleCompletedReceives(List<ClientResponse> responses, long now) {
         for (NetworkReceive receive : this.selector.completedReceives()) {
+            // source是Broker的编号
             String source = receive.source();
+            /**
+             * 从此broker的inFlight队列中移除并返回已完成的请求，腾出空间给新的请求
+             * 写入inFlight队列的位置在{@link NetworkClient#doSend(ClientRequest, boolean, long, AbstractRequest)}
+             */
             InFlightRequest req = inFlightRequests.completeNext(source);
             Struct responseStruct = parseStructMaybeUpdateThrottleTimeMetrics(receive.payload(), req.header,
                 throttleTimeSensor, now);
@@ -688,8 +701,10 @@ public class NetworkClient implements KafkaClient {
             }
             AbstractResponse body = createResponse(responseStruct, req.header);
             if (req.isInternalRequest && body instanceof MetadataResponse)
+                // 更新元数据
                 metadataUpdater.handleCompletedMetadataResponse(req.header, now, (MetadataResponse) body);
             else if (req.isInternalRequest && body instanceof ApiVersionsResponse)
+                // 更新node版本，此请求往往是首先发出的
                 handleApiVersionsResponse(responses, req, now, (ApiVersionsResponse) body);
             else
                 responses.add(req.completed(body, now));
