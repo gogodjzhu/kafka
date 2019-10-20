@@ -359,6 +359,7 @@ public class KafkaProducer<K, V> implements Producer<K, V> {
             this.maxBlockTimeMs = config.getLong(ProducerConfig.MAX_BLOCK_MS_CONFIG);
             this.requestTimeoutMs = config.getInt(ProducerConfig.REQUEST_TIMEOUT_MS_CONFIG);
             this.transactionManager = configureTransactionState(config);
+            // 重试次数
             int retries = configureRetries(config, transactionManager != null);
             int maxInflightRequests = configureInflightRequests(config, transactionManager != null);
             short acks = configureAcks(config, transactionManager != null);
@@ -465,6 +466,7 @@ public class KafkaProducer<K, V> implements Producer<K, V> {
             // this the default.
             log.info("Overriding the default retries config to the recommended value of {} since the idempotent " +
                     "producer is enabled.", Integer.MAX_VALUE);
+            // 启用了幂等性配置，那么将重试次数设置为最大值
             return Integer.MAX_VALUE;
         }
         if (idempotenceEnabled && config.getInt(ProducerConfig.RETRIES_CONFIG) == 0) {

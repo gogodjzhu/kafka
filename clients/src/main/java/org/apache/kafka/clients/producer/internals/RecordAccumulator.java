@@ -337,12 +337,13 @@ public final class RecordAccumulator {
 
     /**
      * Re-enqueue the given record batch in the accumulator to retry
+     * 重新将batch添加到队列
      */
     public void reenqueue(ProducerBatch batch, long now) {
         batch.reenqueued(now);
         Deque<ProducerBatch> deque = getOrCreateDeque(batch.topicPartition);
         synchronized (deque) {
-            deque.addFirst(batch);
+            deque.addFirst(batch); // 注意是添加到队头（正常发送的是添加到队尾）
         }
     }
 

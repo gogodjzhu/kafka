@@ -403,7 +403,7 @@ public class NetworkClient implements KafkaClient {
                 header,
                 clientRequest.createdTimeMs(),
                 clientRequest.destination(),
-                clientRequest.callback(),
+                clientRequest.callback(), // 该请求的回调Handler，在请求返回响应的时候会从inflight找回此Handler进行执行
                 clientRequest.expectResponse(),
                 isInternalRequest,
                 request,

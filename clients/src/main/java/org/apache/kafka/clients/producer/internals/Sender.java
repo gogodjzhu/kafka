@@ -472,16 +472,17 @@ public class Sender implements Runnable {
 
     /**
      * Handle a produce response
+     * 处理Produce请求的响应
      */
     private void handleProduceResponse(ClientResponse response, Map<TopicPartition, ProducerBatch> batches, long now) {
         RequestHeader requestHeader = response.requestHeader();
         int correlationId = requestHeader.correlationId();
-        if (response.wasDisconnected()) {
+        if (response.wasDisconnected()) { // 连接断开
             ApiKeys api = ApiKeys.forId(requestHeader.apiKey());
             log.trace("Cancelled {} request {} with correlation id {}  due to node {} being disconnected", api, requestHeader, correlationId, response.destination());
             for (ProducerBatch batch : batches.values())
                 completeBatch(batch, new ProduceResponse.PartitionResponse(Errors.NETWORK_EXCEPTION), correlationId, now);
-        } else if (response.versionMismatch() != null) {
+        } else if (response.versionMismatch() != null) { // 版本不一致
             log.warn("Cancelled request {} due to a version mismatch with node {}",
                     response, response.destination(), response.versionMismatch());
             for (ProducerBatch batch : batches.values())
@@ -509,6 +510,7 @@ public class Sender implements Runnable {
 
     /**
      * Complete or retry the given batch of records.
+     * 完成或者重试batch
      *
      * @param batch The record batch
      * @param response The produce response
@@ -518,10 +520,11 @@ public class Sender implements Runnable {
     private void completeBatch(ProducerBatch batch, ProduceResponse.PartitionResponse response, long correlationId,
                                long now) {
         Errors error = response.error;
-        if (error == Errors.MESSAGE_TOO_LARGE && batch.recordCount > 1 &&
+        if (error == Errors.MESSAGE_TOO_LARGE && batch.recordCount > 1 && // 单个batch内的消息大于1，且该batch消息体积过大
                 (batch.magic() >= RecordBatch.MAGIC_VALUE_V2 || batch.isCompressed())) {
             // If the batch is too large, we split the batch and send the split batches again. We do not decrement
             // the retry attempts in this case.
+            // 分裂batch，重发。主意这种情况不占用重试次数
             log.warn("Got error produce response in correlation id {} on topic-partition {}, splitting and retrying ({} attempts left). Error: {}",
                      correlationId,
                      batch.topicPartition,
@@ -532,12 +535,14 @@ public class Sender implements Runnable {
             this.sensors.recordBatchSplit();
         } else if (error != Errors.NONE) {
             if (canRetry(batch, error)) {
+                // 错误可重试， 重试发送
                 log.warn("Got error produce response with correlation id {} on topic-partition {}, retrying ({} attempts left). Error: {}",
                         correlationId,
                         batch.topicPartition,
                         this.retries - batch.attempts() - 1,
                         error);
                 if (transactionManager == null) {
+                    // 无事务管理，直接将batch添加到RecordAccumulator队列，消耗重试次数
                     reenqueueBatch(batch, now);
                 } else if (transactionManager.hasProducerIdAndEpoch(batch.producerId(), batch.producerEpoch())) {
                     // If idempotence is enabled only retry the request if the current producer id is the same as
@@ -552,6 +557,7 @@ public class Sender implements Runnable {
                     this.sensors.recordErrors(batch.topicPartition.topic(), batch.recordCount);
                 }
             } else {
+                // 错误不可重试，封装异常，让该batch失败
                 final RuntimeException exception;
                 if (error == Errors.TOPIC_AUTHORIZATION_FAILED)
                     exception = new TopicAuthorizationException(batch.topicPartition.topic());
@@ -621,12 +627,15 @@ public class Sender implements Runnable {
                 transactionManager.transitionToAbortableError(exception);
             }
         }
+        // 无事务管理，直接失败此batch，回调CallbackHandler
         batch.done(baseOffset, logAppendTime, exception);
+        // 释放此batch的空间，给回accumulator，但并不是真正的释放内存空间
         this.accumulator.deallocate(batch);
     }
 
     /**
      * We can retry a send if the error is transient and the number of attempts taken is fewer than the maximum allowed
+     * 判断是否可重试发送失败的batch，根据error的异常类型和最大重试次数来判断
      */
     private boolean canRetry(ProducerBatch batch, Errors error) {
         return batch.attempts() < this.retries && error.exception() instanceof RetriableException;
@@ -686,6 +695,7 @@ public class Sender implements Runnable {
         // 使用Builder的主要目的是为了兼容(校验)不同版本的消息格式
         ProduceRequest.Builder requestBuilder = new ProduceRequest.Builder(minUsedMagic, acks, timeout,
                 produceRecordsByPartition, transactionalId);
+        // 设置此Request的回调Handler，里面封装了重试方法
         RequestCompletionHandler callback = new RequestCompletionHandler() {
             public void onComplete(ClientResponse response) {
                 handleProduceResponse(response, recordsByPartition, time.milliseconds());
