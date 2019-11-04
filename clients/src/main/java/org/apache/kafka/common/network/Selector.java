@@ -351,10 +351,10 @@ public class Selector implements Selectable, AutoCloseable {
         if (timeout < 0)
             throw new IllegalArgumentException("timeout should be >= 0");
 
-        // 清空事件缓存, 这样在集合中获取到的事件都是上一次poll之后发生的
+        // 清空缓存, 这样在集合中获取到的事件都是上一次poll之后发生的
         clear();
 
-        // hasStagedReceives=true 表示有的数据包尚未发送完成, 他们暂存在stagedReceives
+        // hasStagedReceives=true 表示有的数据包尚未接收完成, 他们暂存在stagedReceives
         // 中. 所以可以预计马上会有新的剩余数据到来. 所以将timeout设为0.
         // immediatelyConnectedKeys保存的是那些在建立连接时当即完成的key, 他们不会有新
         // 的connect时间发生, 需要特殊处理, 将这些channel初始化. 所以也将timeout设为0
@@ -372,7 +372,6 @@ public class Selector implements Selectable, AutoCloseable {
             // 处理新事件
             pollSelectionKeys(this.nioSelector.selectedKeys(), false, endSelect);
             // 处理immediatelyConnected Channel的初始化, 注意第二个参数为true以区分
-            // 普通事件
             pollSelectionKeys(immediatelyConnectedKeys, true, endSelect);
         }
 
@@ -453,7 +452,7 @@ public class Selector implements Selectable, AutoCloseable {
                     NetworkReceive networkReceive;
                     // 循环从channel中获取数据放入全局缓存
                     // 这里有一个很重要的设计！！
-                    // Server端会把一个请求的响应一次性全部返回，并且不会跟其余请求的响应粘包
+                    // 一个请求的响应一次性全部返回，并且不会跟其余请求的响应粘包
                     while ((networkReceive = channel.read()) != null)
                         addToStagedReceives(channel, networkReceive);
                 }
