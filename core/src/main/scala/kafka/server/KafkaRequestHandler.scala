@@ -49,6 +49,7 @@ class KafkaRequestHandler(id: Int,
           // time_window is independent of the number of threads, each recorded idle
           // time should be discounted by # threads.
           val startSelectTime = time.nanoseconds
+          // 从requestChannel拉取待处理的请求
           req = requestChannel.receiveRequest(300)
           val endTime = time.nanoseconds
           if (req != null)
@@ -63,6 +64,7 @@ class KafkaRequestHandler(id: Int,
           return
         }
         trace("Kafka request handler %d on broker %d handling request %s".format(id, brokerId, req))
+        // KafkaApi是处理所有请求的统一入口
         apis.handle(req)
       } catch {
         case e: FatalExitError =>

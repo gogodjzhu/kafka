@@ -52,6 +52,9 @@ object Kafka extends Logging {
     props
   }
 
+  /**
+    * kafkaServer端main方法入口
+    */
   def main(args: Array[String]): Unit = {
     try {
       val serverProps = getPropsFromArgs(args)
