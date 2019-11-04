@@ -223,20 +223,9 @@ public class Sender implements Runnable {
             }
         }
 
-        /**
-         * 普通不带事务的发送
-         * 下面两个方法分别做了两个事情:
-         * 1. 从accumulator中拉取数据(batch), 放入({@link org.apache.kafka.common.network.KafkaChannel#send})
-         * 2. 调用client的poll方法, 执行发送KafkaChannel#send中的消息
-         *
-         * 大致来说, 结构是:
-         *  1. Sender整理/校验/合并同node数据
-         *  2. NetworkClient报文格式化/版本校验
-         *  3. Selector缓存Map(node -> KafkaChannel)
-         *  4. KafkaChannel维持单个node的连接, 处理消息发送
-         */
-
+        // sendProducerData方法从accumulator队列中获取新的可发送数据，封装为Send对象，添加到发送目标的kafkaChannel缓存
         long pollTimeout = sendProducerData(now);
+        // poll方法底层调用nioSelector方法的poll方法，捕捉到可发送事件时把Send对象包含的消息发送出去
         client.poll(pollTimeout, now);
     }
 
