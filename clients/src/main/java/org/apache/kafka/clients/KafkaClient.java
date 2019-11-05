@@ -28,10 +28,22 @@ import java.util.List;
  * 作为客户端, 它定义了一下几种方法(功能):
  * 1. 连接状态的维护
  *    {@link this#ready(Node, long)} - 建立连接
- *    {@link this#disconnect(String)}, {@link this#close(String)} - 断开连接
+ *    {@link this#disconnect(String)} - 断开连接
+ *    {@link this#close(String)} - 关闭连接
  *    {@link this#isReady(Node, long)},
  *    {@link this#connectionFailed(Node)}
  *    {@link this#connectionDelay(Node, long)} - 连接状态的获取
+ * 2. 消息的传输(注意这里了提供的send/poll方法均是面向ClientRequest/ClientResponse的，它封装了所有类型的请求/响应，本类只处理io，
+ *      类型被忽略)
+ *    {@link this#send(ClientRequest, long)} - 发送消息
+ *    {@link this#poll(long, long)} - 获取socket响应
+ *    {@link this#newClientRequest(String, AbstractRequest.Builder, long, boolean)} - 构造无回调的客户端请求
+ *    {@link this#newClientRequest(String, AbstractRequest.Builder, long, boolean, RequestCompletionHandler)} - 构造有回
+ *      调的客户端请求
+ * 3. 集群状态(由于接口处理的是客户端对整个集群的通信，所以也支持面对集群的一些操作)
+ *    {@link this#leastLoadedNode(long)} 集群中负载最低的节点
+ *    {@link this#hasReadyNodes()} 判断是否有已建立连接的节点
+ *
  *
  */
 public interface KafkaClient extends Closeable {

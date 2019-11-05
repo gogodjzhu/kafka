@@ -222,7 +222,7 @@ public class NetworkClient implements KafkaClient {
 
         if (connectionStates.canConnect(node.idString(), now))
             // if we are interested in sending to a node and we don't have a connection to it, initiate one
-            initiateConnect(node, now);
+            initiateConnect(node, now); // 因发送数据需要，创建节点连接
 
         return false;
     }
@@ -795,7 +795,10 @@ public class NetworkClient implements KafkaClient {
 
     /**
      * Initiate a connection to the given node
-     * 创建指向node(broker)的连接
+     * 客户端创建指向node(broker)的连接
+     * 可能在两种情况下创建连接：
+     * 1. 更新元数据
+     * 2. 发送数据
      */
     private void initiateConnect(Node node, long now) {
         String nodeConnectionId = node.idString();
@@ -929,7 +932,7 @@ public class NetworkClient implements KafkaClient {
 
         /**
          * Add a metadata request to the list of sends if we can make one
-         * 尝试添加MetadataUpdateRequest到发送缓存, 或者在指定node未就绪的时候准备node
+         * 尝试添加指向node的 "元数据更新请求"
          */
         private long maybeUpdate(long now, Node node) {
             String nodeConnectionId = node.idString();
@@ -963,7 +966,7 @@ public class NetworkClient implements KafkaClient {
                 // we don't have a connection to this node right now, make one
                 log.debug("Initialize connection to node {} for sending metadata request", node);
                 // 未曾连接, 新建连接
-                initiateConnect(node, now);
+                initiateConnect(node, now); // 因更新元数据需要，创建节点连接
                 return reconnectBackoffMs;
             }
 
