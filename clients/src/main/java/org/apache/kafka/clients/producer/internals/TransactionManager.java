@@ -57,6 +57,7 @@ import static org.apache.kafka.common.record.RecordBatch.NO_PRODUCER_ID;
 
 /**
  * A class which maintains state for transactions. Also keeps the state necessary to ensure idempotent production.
+ * 本类用于维护 事务 和 幂等性 的状态
  */
 public class TransactionManager {
     private static final Logger log = LoggerFactory.getLogger(TransactionManager.class);
@@ -67,11 +68,16 @@ public class TransactionManager {
 
     public final String logPrefix;
 
-    private final Map<TopicPartition, Integer> sequenceNumbers;
+    private final Map<TopicPartition, Integer> sequenceNumbers; // producer实例内的TopicPartition-batch唯一性标识
+    // 事务请求队列, 此队列的请求会被Sender线程优先发送(较之普通的数据请求)
     private final PriorityQueue<TxnRequestHandler> pendingRequests;
+    // 当前事务新涉及(未提交Coordinator)的分区, 提交后会转移到pendingPartitionsInTransaction
     private final Set<TopicPartition> newPartitionsInTransaction;
+    // 当前事务正在通过AddPartitionsToTxnRequest提交给TxnCoordinator, 并等待响应的Partition
     private final Set<TopicPartition> pendingPartitionsInTransaction;
+    // 当前事务涉及(已通过AddPartitionsToTxnRequest提交给TxnCoordinator)的分区, 事务内只有对这些分区进行修改才被允许
     private final Set<TopicPartition> partitionsInTransaction;
+    // 为Consumer-<Process>-Producer设计的, 将 消费-处理-生产 放在一个事务内完成 以实现这种常见业务场景的事务完整性
     private final Map<TopicPartition, CommittedOffset> pendingTxnOffsetCommits;
 
     // This is used by the TxnRequestHandlers to control how long to back off before a given request is retried.
@@ -142,18 +148,33 @@ public class TransactionManager {
         }
     }
 
+    /**
+     * 事务管理器构造方法，此方法在幂等/EOS Producer创建的时候被调用。注意生成的实例并未向Server申请ProducerID/ProducerEpoch资源，
+     * 仅做占位标志，在真正发送数据的时候才作申请
+     * @param transactionalId 事务id, 由用户手动指定
+     * @param transactionTimeoutMs 事务超时时间
+     * @param retryBackoffMs 重试前等待时间，防止频繁重试
+     */
     public TransactionManager(String transactionalId, int transactionTimeoutMs, long retryBackoffMs) {
+        // 用于标识一个Producer的关键ProducerId并未指定
         this.producerIdAndEpoch = new ProducerIdAndEpoch(NO_PRODUCER_ID, NO_PRODUCER_EPOCH);
+        // 保存所有sequenceNumber, Producer发送的每个Batch都有一个单调递增的Id用于标识(结合TopicPartition/ProducerId一起)
         this.sequenceNumbers = new HashMap<>();
         this.transactionalId = transactionalId;
         this.logPrefix = transactionalId == null ? "" : "[TransactionalId " + transactionalId + "] ";
         this.transactionTimeoutMs = transactionTimeoutMs;
+        // transactionCoordinator 所在的Node
         this.transactionCoordinator = null;
+        // consumerGroupCoordinator 所在的Node
         this.consumerGroupCoordinator = null;
+
+        /* 为事务设计的几种TopicPartition概念，对不同类型的TopicPartition操作需要不同的机制来保证事务特性 */
         this.newPartitionsInTransaction = new HashSet<>();
         this.pendingPartitionsInTransaction = new HashSet<>();
         this.partitionsInTransaction = new HashSet<>();
         this.pendingTxnOffsetCommits = new HashMap<>();
+
+        // 事务操作队列
         this.pendingRequests = new PriorityQueue<>(10, new Comparator<TxnRequestHandler>() {
             @Override
             public int compare(TxnRequestHandler o1, TxnRequestHandler o2) {
@@ -169,19 +190,21 @@ public class TransactionManager {
     }
 
     public synchronized TransactionalRequestResult initializeTransactions() {
-        ensureTransactional();
-        transitionTo(State.INITIALIZING);
+        ensureTransactional(); // 检查transactional.id配置存在
+        transitionTo(State.INITIALIZING); // 事务状态检查与切换
         setProducerIdAndEpoch(ProducerIdAndEpoch.NONE);
-        this.sequenceNumbers.clear();
+        this.sequenceNumbers.clear(); // 重置sequenceNumber
+        /** 构造&发送InitProducerIdRequest用于请求PID */
         InitProducerIdRequest.Builder builder = new InitProducerIdRequest.Builder(transactionalId, transactionTimeoutMs);
         InitProducerIdHandler handler = new InitProducerIdHandler(builder);
-        enqueueRequest(handler);
+        enqueueRequest(handler); /** 底层实际未发送，仅仅添加到消息队列，由{@link Sender#run(long)} */
         return handler.result;
     }
 
     public synchronized void beginTransaction() {
-        ensureTransactional();
+        ensureTransactional(); // 判断配置上开启了事务，即配置了transactional.id
         maybeFailWithError();
+        // 将currentState修改为InTransaction(前置状态必须为Ready)
         transitionTo(State.IN_TRANSACTION);
     }
 
@@ -189,7 +212,7 @@ public class TransactionManager {
         ensureTransactional();
         maybeFailWithError();
         transitionTo(State.COMMITTING_TRANSACTION);
-        return beginCompletingTransaction(TransactionResult.COMMIT);
+        return beginCompletingTransaction(TransactionResult.COMMIT); // beginCommit()
     }
 
     public synchronized TransactionalRequestResult beginAbort() {
@@ -200,7 +223,7 @@ public class TransactionManager {
 
         // We're aborting the transaction, so there should be no need to add new partitions
         newPartitionsInTransaction.clear();
-        return beginCompletingTransaction(TransactionResult.ABORT);
+        return beginCompletingTransaction(TransactionResult.ABORT); // beginAbort()
     }
 
     private TransactionalRequestResult beginCompletingTransaction(TransactionResult transactionResult) {
@@ -229,6 +252,10 @@ public class TransactionManager {
         return handler.result;
     }
 
+    /**
+     * 判断指定TopicPartition是否为当前事务新涉及的, 若是则将其添加到新分区队列(稍后会组织成AddPartitionRequest发送给TxnCoordinator
+     * 见: {@link this#nextRequestHandler(boolean)})
+     */
     public synchronized void maybeAddPartitionToTransaction(TopicPartition topicPartition) {
         failIfNotReadyForSend();
 
@@ -389,18 +416,26 @@ public class TransactionManager {
         sequenceNumbers.put(topicPartition, currentSequenceNumber);
     }
 
+    /**
+     * 尝试从待发消息队列拉取一个新的事务请求处理器
+     * @param hasIncompleteBatches 是否有未发完的batch，true时返回null
+     */
     synchronized TxnRequestHandler nextRequestHandler(boolean hasIncompleteBatches) {
         if (!newPartitionsInTransaction.isEmpty())
+            // 有新增TopicPartition, 添加AddPartitionsToTxnRequest到请求队列
             enqueueRequest(addPartitionsToTransactionHandler());
 
+        // 注意使用的是peek方法，并不会真正从队列移除数据
         TxnRequestHandler nextRequestHandler = pendingRequests.peek();
         if (nextRequestHandler == null)
             return null;
 
         // Do not send the EndTxn until all batches have been flushed
+        // 有batch尚未结束，不发送结束事务的请求
         if (nextRequestHandler.isEndTxn() && hasIncompleteBatches)
             return null;
 
+        // 确定要发送下一个请求，poll
         pendingRequests.poll();
         if (maybeTerminateRequestWithError(nextRequestHandler)) {
             log.trace("{}Not sending transactional request {} because we are in an error state",
@@ -566,6 +601,11 @@ public class TransactionManager {
         partitionsInTransaction.clear();
     }
 
+    /**
+     * 检查newPartitionsInTransaction(事务新涉及的TopicPartition) 添加到 pendingPartitionsInTransaction()
+     * 并构造AddPartitionsToTxnRequest请求到TxnManager请求队列
+     * @return
+     */
     private synchronized TxnRequestHandler addPartitionsToTransactionHandler() {
         pendingPartitionsInTransaction.addAll(newPartitionsInTransaction);
         newPartitionsInTransaction.clear();
@@ -587,6 +627,9 @@ public class TransactionManager {
         return new TxnOffsetCommitHandler(result, builder);
     }
 
+    /**
+     * 事务请求回调处理器 抽象，在 {@link RequestCompletionHandler#onComplete(ClientResponse)} 的基础上增加了事务请求特有的一些操作
+     */
     abstract class TxnRequestHandler implements RequestCompletionHandler {
         protected final TransactionalRequestResult result;
         private boolean isRetry = false;
@@ -631,6 +674,7 @@ public class TransactionManager {
         @SuppressWarnings("unchecked")
         public void onComplete(ClientResponse response) {
             if (response.requestHeader().correlationId() != inFlightRequestCorrelationId) {
+                // 事务请求同时只能发一条消息
                 fatalError(new RuntimeException("Detected more than one in-flight transactional request."));
             } else {
                 clearInFlightRequestCorrelationId();
@@ -645,6 +689,7 @@ public class TransactionManager {
                     log.trace("{}Received transactional response {} for request {}", logPrefix,
                             response.responseBody(), requestBuilder());
                     synchronized (TransactionManager.this) {
+                        // 真实处理响应，此方法由具体类型的子类Handler实现
                         handleResponse(response.responseBody());
                     }
                 } else {
@@ -679,11 +724,15 @@ public class TransactionManager {
 
         abstract AbstractRequest.Builder<?> requestBuilder();
 
+        // 真实处理响应
         abstract void handleResponse(AbstractResponse responseBody);
 
         abstract Priority priority();
     }
 
+    /**
+     * 初始化ProducerId的请求回调处理器
+     */
     private class InitProducerIdHandler extends TxnRequestHandler {
         private final InitProducerIdRequest.Builder builder;
 
@@ -706,10 +755,10 @@ public class TransactionManager {
             InitProducerIdResponse initProducerIdResponse = (InitProducerIdResponse) response;
             Errors error = initProducerIdResponse.error();
 
-            if (error == Errors.NONE) {
+            if (error == Errors.NONE) { // 成功
                 ProducerIdAndEpoch producerIdAndEpoch = new ProducerIdAndEpoch(initProducerIdResponse.producerId(), initProducerIdResponse.epoch());
                 setProducerIdAndEpoch(producerIdAndEpoch);
-                transitionTo(State.READY);
+                transitionTo(State.READY); // TransactionManager实例状态转为Ready，已经可以开始执行事务请求
                 lastError = null;
                 result.done();
             } else if (error == Errors.NOT_COORDINATOR || error == Errors.COORDINATOR_NOT_AVAILABLE) {

@@ -81,6 +81,14 @@ class KafkaRequestHandler(id: Int,
 
 }
 
+/**
+  * 客户端的请求最终被封装成 RequestHandler#Request在KafkaRequestHandler中执行.
+  * @param brokerId brokerId
+  * @param requestChannel socketServer的worker线程会对网络包封装成RequestHandler#Request对象, 所有worker线程通过同一个requestChannel实例. 指向此HandlerPool
+  * @param apis API接口, 对Request对象做业务处理
+  * @param time 启动时间
+  * @param numThreads 线程数
+  */
 class KafkaRequestHandlerPool(val brokerId: Int,
                               val requestChannel: RequestChannel,
                               val apis: KafkaApis,

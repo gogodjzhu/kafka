@@ -51,8 +51,8 @@ import scala.util.control.{ControlThrowable, NonFatal}
  *
  * << 1-N-M模型 >>
  * 1个Acceptor监听线程，负责监听新的socket连接, 实现类为kafka.network.Acceptor
- * N个IO线程，负责对socket进行读写，N一般等于cpu的核数, 实现类为kafka.network.Processor, 通过num.network.threads配置, 默认为3
- * M个worker线程，负责处理数据, 实现类为kafka.server.KafkaRequestHandler, 通过num.io.threads配置, 默认为8
+ * N个Worker线程，负责对socket进行读写，N一般等于cpu的核数, 实现类为kafka.network.Processor, 通过num.network.threads配置, 默认为3
+ * M个IO线程，负责处理数据, 实现类为kafka.server.KafkaRequestHandler, 通过num.io.threads配置, 默认为8
  *
  */
 class SocketServer(val config: KafkaConfig, val metrics: Metrics, val time: Time, val credentialProvider: CredentialProvider) extends Logging with KafkaMetricsGroup {
@@ -125,6 +125,7 @@ class SocketServer(val config: KafkaConfig, val metrics: Metrics, val time: Time
   }
 
   // register the processor threads for notification of responses
+  // 注册唤醒方法, 在kafkaApis处理完请求后, 会触发onResponse方法
   requestChannel.addResponseListener(id => processors(id).wakeup())
 
   /**
@@ -460,7 +461,7 @@ private[kafka] class Processor(val id: Int,
         processNewResponses()
         // 执行通过channel 获取请求/返回响应 的实际动作
         poll()
-        // 处理已接收的完整消息包，即做实际的逻辑处理
+        // 处理已接收的完整消息包，封装成 RequestChannel#Request 对象, 添加到requestChannel
         processCompletedReceives()
         // 处理已发送的消息包，做发送后的统计和unmute相关工作
         processCompletedSends()
@@ -505,6 +506,7 @@ private[kafka] class Processor(val id: Int,
             close(selector, curr.request.connectionId)
         }
       } finally {
+        // 下一个
         curr = requestChannel.receiveResponse(id)
       }
     }
@@ -521,7 +523,9 @@ private[kafka] class Processor(val id: Int,
       response.request.updateRequestMetrics(0L)
     }
     else {
+      // 将内容写入selector缓存
       selector.send(responseSend)
+      // inflight
       inflightResponses += (connectionId -> response)
     }
   }

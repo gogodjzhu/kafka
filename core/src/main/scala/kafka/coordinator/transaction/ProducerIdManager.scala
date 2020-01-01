@@ -134,6 +134,10 @@ class ProducerIdManager(val brokerId: Int, val zkUtils: ZkUtils) extends Logging
     }
   }
 
+  /**
+    * 生成全局唯一的ProducerId
+    * 全局唯一的根本保证在于zk的协同，这里使用批量(每次1000)方式从zk申请，按需授予客户端
+    */
   def generateProducerId(): Long = {
     this synchronized {
       // grab a new block of producerIds if this block has been exhausted

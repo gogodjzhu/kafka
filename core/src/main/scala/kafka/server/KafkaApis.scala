@@ -458,9 +458,11 @@ class KafkaApis(val requestChannel: RequestChannel,
     if (authorizedRequestInfo.isEmpty)
       sendResponseCallback(Map.empty)
     else {
+      // 标志是否允许写入内部topic，通过是否为admin客户端发起的响应来判断
       val internalTopicsAllowed = request.header.clientId == AdminUtils.AdminClientId
 
       // call the replica manager to append messages to the replicas
+      // 处理接受到的消息，添加到本地存储（或者在ack机制要求的时候等待follower节点响应）
       replicaManager.appendRecords(
         timeout = produceRequest.timeout.toLong,
         requiredAcks = produceRequest.acks,
@@ -477,6 +479,7 @@ class KafkaApis(val requestChannel: RequestChannel,
 
   /**
    * Handle a fetch request
+   * 处理FetchRequest请求
    */
   def handleFetchRequest(request: RequestChannel.Request) {
     val fetchRequest = request.body[FetchRequest]
@@ -623,7 +626,7 @@ class KafkaApis(val requestChannel: RequestChannel,
         fetchRequest.replicaId,
         fetchRequest.minBytes,
         fetchRequest.maxBytes,
-        versionId <= 2,
+        versionId <= 2, // hardMaxBytesLimit, 当version <= 2时. 控制batch内唯一的消息大于maxBytes是否依然发送
         authorizedRequestInfo,
         replicationQuota(fetchRequest),
         processResponseCallback,
@@ -646,9 +649,12 @@ class KafkaApis(val requestChannel: RequestChannel,
   def replicationQuota(fetchRequest: FetchRequest): ReplicaQuota =
     if (fetchRequest.isFromFollower) quotas.leader else UnboundedQuota
 
+  // 处理获取partition offset请求
   def handleListOffsetRequest(request: RequestChannel.Request) {
     val version = request.header.apiVersion()
-
+    /* v0版本仅支持按照timestamp选择offset, 且以segment文件最后的修改时间作为判断依据
+     * V1版本消息体中保存了更新时间, 可以精确以消息更新时间为依据
+     * 另外V1AndAbove版本增加了事务相关的"读提交", "读未提交"的筛选条件 */
     val mergedResponseMap = if (version == 0)
       handleListOffsetRequestV0(request)
     else
@@ -658,7 +664,7 @@ class KafkaApis(val requestChannel: RequestChannel,
   }
 
   private def handleListOffsetRequestV0(request : RequestChannel.Request) : Map[TopicPartition, ListOffsetResponse.PartitionData] = {
-    val correlationId = request.header.correlationId
+    val correlationId = request.header.correlationId // 请求id
     val clientId = request.header.clientId
     val offsetRequest = request.body[ListOffsetRequest]
 
@@ -674,6 +680,7 @@ class KafkaApis(val requestChannel: RequestChannel,
       try {
         // ensure leader exists
         val localReplica = if (offsetRequest.replicaId != ListOffsetRequest.DEBUGGING_REPLICA_ID)
+          // 对于非debugReplica, 能处理listOffset请求的只有PartitionLeader
           replicaManager.getLeaderReplicaIfLocal(topicPartition)
         else
           replicaManager.getReplicaOrException(topicPartition)
@@ -803,12 +810,16 @@ class KafkaApis(val requestChannel: RequestChannel,
     }
   }
 
+  /**
+    * 获取log内, 满足最近修改时间小于timestamp的segment的最小offset
+    */
   private[server] def fetchOffsetsBefore(log: Log, timestamp: Long, maxNumOffsets: Int): Seq[Long] = {
     // Cache to avoid race conditions. `toBuffer` is faster than most alternatives and provides
     // constant time access while being safe to use with concurrent collections unlike `toArray`.
     val segments = log.logSegments.toBuffer
     val lastSegmentHasSize = segments.last.size > 0
 
+    // [(segment可供client消费的最小offset, segment最近修改时间)]
     val offsetTimeArray =
       if (lastSegmentHasSize)
         new Array[(Long, Long)](segments.length + 1)
@@ -817,7 +828,7 @@ class KafkaApis(val requestChannel: RequestChannel,
 
     for (i <- segments.indices)
       offsetTimeArray(i) = (math.max(segments(i).baseOffset, log.logStartOffset), segments(i).lastModified)
-    if (lastSegmentHasSize)
+    if (lastSegmentHasSize) // NOTE WHAT?
       offsetTimeArray(segments.length) = (log.logEndOffset, time.milliseconds)
 
     var startIndex = -1
@@ -1027,6 +1038,7 @@ class KafkaApis(val requestChannel: RequestChannel,
               .partition(authorizeTopicDescribe)
 
             // version 0 reads offsets from ZK
+            // version 0 从ZK读取offset进度
             val authorizedPartitionData = authorizedPartitions.map { topicPartition =>
               val topicDirs = new ZKGroupTopicDirs(offsetFetchRequest.groupId, topicPartition.topic)
               try {
@@ -1053,7 +1065,8 @@ class KafkaApis(val requestChannel: RequestChannel,
             new OffsetFetchResponse(requestThrottleMs, Errors.NONE, (authorizedPartitionData ++ unauthorizedPartitionData).asJava)
           } else {
             // versions 1 and above read offsets from Kafka
-            if (offsetFetchRequest.isAllPartitions) {
+            // version 1 以后从kafkaBroker读取offset
+            if (offsetFetchRequest.isAllPartitions) { // 未指定partition, 获取当前group订阅的所有partition的offset
               val (error, allPartitionData) = groupCoordinator.handleFetchOffsets(offsetFetchRequest.groupId)
               if (error != Errors.NONE)
                 offsetFetchRequest.getErrorResponse(requestThrottleMs, error)
@@ -1090,11 +1103,14 @@ class KafkaApis(val requestChannel: RequestChannel,
 
     if (findCoordinatorRequest.coordinatorType == FindCoordinatorRequest.CoordinatorType.GROUP &&
         !authorize(request.session, Describe, new Resource(Group, findCoordinatorRequest.coordinatorKey)))
+      // 鉴权
       sendErrorResponse(Errors.GROUP_AUTHORIZATION_FAILED)
     else if (findCoordinatorRequest.coordinatorType == FindCoordinatorRequest.CoordinatorType.TRANSACTION &&
         !authorize(request.session, Describe, new Resource(TransactionalId, findCoordinatorRequest.coordinatorKey)))
+      // 鉴权
       sendErrorResponse(Errors.TRANSACTIONAL_ID_AUTHORIZATION_FAILED)
     else {
+      // 获取coordinator相关元数据(或者在必要的时候创建)
       // get metadata (and create the topic if necessary)
       val (partition, topicMetadata) = findCoordinatorRequest.coordinatorType match {
         case FindCoordinatorRequest.CoordinatorType.GROUP =>
@@ -1103,7 +1119,9 @@ class KafkaApis(val requestChannel: RequestChannel,
           (partition, metadata)
 
         case FindCoordinatorRequest.CoordinatorType.TRANSACTION =>
+          // coordinatorKey对于FindCoordinatorRequest是transactionalId, partitionFor方法的本质则是对分区数取模
           val partition = txnCoordinator.partitionFor(findCoordinatorRequest.coordinatorKey)
+          // 获取'事务状态Topic'的元数据(如果没有此Topic则尝试创建)
           val metadata = getOrCreateInternalTopic(TRANSACTION_STATE_TOPIC_NAME, request.listenerName)
           (partition, metadata)
 
@@ -1115,6 +1133,7 @@ class KafkaApis(val requestChannel: RequestChannel,
         val responseBody = if (topicMetadata.error != Errors.NONE) {
           new FindCoordinatorResponse(requestThrottleMs, Errors.COORDINATOR_NOT_AVAILABLE, Node.noNode)
         } else {
+          // 寻找Coordinator的关键: 所谓的Coordinator, 即是保存coordinator状态信息的partition的leader节点
           val coordinatorEndpoint = topicMetadata.partitionMetadata.asScala
             .find(_.partition == partition)
             .map(_.leader)
@@ -1472,9 +1491,16 @@ class KafkaApis(val requestChannel: RequestChannel,
       }
       sendResponseMaybeThrottle(request, createResponse)
     }
+
+
+    /**校验完毕，开始实际操作*/
+
     txnCoordinator.handleInitProducerId(transactionalId, initProducerIdRequest.transactionTimeoutMs, sendResponseCallback)
   }
 
+  /**
+    * 处理事务结束(包括提交和回滚)请求
+    */
   def handleEndTxnRequest(request: RequestChannel.Request): Unit = {
     ensureInterBrokerVersion(KAFKA_0_11_0_IV0)
     val endTxnRequest = request.body[EndTxnRequest]
@@ -1490,16 +1516,23 @@ class KafkaApis(val requestChannel: RequestChannel,
         sendResponseMaybeThrottle(request, createResponse)
       }
 
+      // 开始处理事务结束
       txnCoordinator.handleEndTransaction(endTxnRequest.transactionalId,
         endTxnRequest.producerId,
         endTxnRequest.producerEpoch,
-        endTxnRequest.command,
+        endTxnRequest.command, // TransactionResult.COMMIT or TransactionResult.Abort
         sendResponseCallback)
     } else
+    // 无权限
       sendResponseMaybeThrottle(request, requestThrottleMs =>
         new EndTxnResponse(requestThrottleMs, Errors.TRANSACTIONAL_ID_AUTHORIZATION_FAILED))
   }
 
+  /**
+    * 处理WriteTxnMarker请求(事务数据的落地), 接收此请求的broker必然是若干TopicPartition的leader, 请求中的markers指向这个
+    * leader维护的部分TopicPartition
+    * 最终以ControlRecord的形式写入数据Partition(跟普通的数据Record在一起, consumer消费的时候会过滤controlRecord)
+    */
   def handleWriteTxnMarkersRequest(request: RequestChannel.Request): Unit = {
     ensureInterBrokerVersion(KAFKA_0_11_0_IV0)
     authorizeClusterAction(request)
@@ -1536,6 +1569,7 @@ class KafkaApis(val requestChannel: RequestChannel,
       if (successfulOffsetsPartitions.nonEmpty) {
         // as soon as the end transaction marker has been written for a transactional offset commit,
         // call to the group coordinator to materialize the offsets into the cache
+        // 事务成功提交, 修改groupCoordinator的offset缓存使修改可见
         try {
           groupCoordinator.scheduleHandleTxnCompletion(producerId, successfulOffsetsPartitions, result)
         } catch {
@@ -1547,6 +1581,7 @@ class KafkaApis(val requestChannel: RequestChannel,
         }
       }
 
+      // 所有marker处理结束才响应WriteTxnMarkerReq请求
       if (numAppends.decrementAndGet() == 0)
         sendResponseExemptThrottle(RequestChannel.Response(request, new WriteTxnMarkersResponse(errors)))
     }
@@ -1580,6 +1615,7 @@ class KafkaApis(val requestChannel: RequestChannel,
         numAppends.decrementAndGet()
         skippedMarkers += 1
       } else {
+        // controlRecords
         val controlRecords = partitionsWithCompatibleMessageFormat.map { partition =>
           val controlRecordType = marker.transactionResult match {
             case TransactionResult.COMMIT => ControlRecordType.COMMIT
@@ -1589,12 +1625,13 @@ class KafkaApis(val requestChannel: RequestChannel,
           partition -> MemoryRecords.withEndTransactionMarker(producerId, marker.producerEpoch, endTxnMarker)
         }.toMap
 
+        // 写入leader并等待replica ack(acks=-1等效于all)
         replicaManager.appendRecords(
           timeout = config.requestTimeoutMs.toLong,
           requiredAcks = -1,
           internalTopicsAllowed = true,
           isFromClient = false,
-          entriesPerPartition = controlRecords,
+          entriesPerPartition = controlRecords, // TopicPartition -> MemoryRecords
           responseCallback = maybeSendResponseCallback(producerId, marker.transactionResult))
       }
     }
@@ -1619,6 +1656,7 @@ class KafkaApis(val requestChannel: RequestChannel,
       sendResponseMaybeThrottle(request, requestThrottleMs =>
         addPartitionsToTxnRequest.getErrorResponse(requestThrottleMs, Errors.TRANSACTIONAL_ID_AUTHORIZATION_FAILED.exception))
     else {
+      // 内部topic, 不允许操作, 若不为空稍后报错
       val internalTopics = partitionsToAdd.asScala.filter {tp => org.apache.kafka.common.internals.Topic.isInternal(tp.topic())}
 
       val (existingAndAuthorizedForDescribeTopics, nonExistingOrUnauthorizedForDescribeTopics) =
@@ -1655,6 +1693,8 @@ class KafkaApis(val requestChannel: RequestChannel,
 
           sendResponseMaybeThrottle(request, createResponse)
         }
+
+        /**校验完毕，开始实际操作*/
 
         txnCoordinator.handleAddPartitionsToTransaction(transactionalId,
           addPartitionsToTxnRequest.producerId,
@@ -2036,6 +2076,15 @@ class KafkaApis(val requestChannel: RequestChannel,
     sendResponseExemptThrottle(response.request, () => requestChannel.sendResponse(response))
   }
 
+  /**
+    * 实际处理响应返回
+    * @param request
+    * @param sendResponseCallback 共有4种回调
+    *                             1. controlledShutdownRequest.handleError
+    *                             2. KafkaApis.sendResponse
+    *                             3. KafkaApis.handleError.sendResponseCallback
+    *                             4. RequestChannel.sendResponse
+    */
   private def sendResponseExemptThrottle(request: RequestChannel.Request, sendResponseCallback: () => Unit) {
     def recordNetworkThreadTimeNanos(timeNanos: Long) {
       quotas.request.recordExempt(nanosToPercentage(timeNanos))

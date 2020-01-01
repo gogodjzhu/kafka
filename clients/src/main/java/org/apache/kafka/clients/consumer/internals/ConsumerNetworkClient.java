@@ -303,6 +303,7 @@ public class ConsumerNetworkClient implements Closeable {
     /**
      * Check whether there is pending request to the given node. This includes both request that
      * have been transmitted (i.e. in-flight requests) and those which are awaiting transmission.
+     * 判断是否有指向node的请求(包括已发送的 和 pending未发送的)
      * @param node The node in question
      * @return A boolean indicating whether there is pending request
      */

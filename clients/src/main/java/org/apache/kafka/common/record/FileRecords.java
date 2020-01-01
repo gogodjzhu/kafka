@@ -276,6 +276,7 @@ public class FileRecords extends AbstractRecords implements Closeable {
      * @param startingPosition The starting position in the file to begin searching from.
      */
     public LogOffsetPosition searchForOffsetWithSize(long targetOffset, int startingPosition) {
+        // batchesFrom返回一个iterator迭代器
         for (FileChannelRecordBatch batch : batchesFrom(startingPosition)) {
             long offset = batch.lastOffset();
             if (offset >= targetOffset)

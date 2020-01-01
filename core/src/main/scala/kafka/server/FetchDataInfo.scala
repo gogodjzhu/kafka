@@ -20,7 +20,10 @@ package kafka.server
 import org.apache.kafka.common.record.Records
 import org.apache.kafka.common.requests.FetchResponse.AbortedTransaction
 
+/**
+  * 单个TP-Log的消费结果
+  */
 case class FetchDataInfo(fetchOffsetMetadata: LogOffsetMetadata,
-                         records: Records,
+                         records: Records, // 消息实体
                          firstEntryIncomplete: Boolean = false,
-                         abortedTransactions: Option[List[AbortedTransaction]] = None)
+                         abortedTransactions: Option[List[AbortedTransaction]] = None) // 需要回滚的事务列表

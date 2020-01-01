@@ -26,6 +26,7 @@ import org.apache.kafka.common.utils.Time
 
 /**
  *  Class for inter-broker send thread that utilize a non-blocking network client.
+ *  供broker内部使用的, 用于定时发送网络请求的线程实现. 子类
  */
 abstract class InterBrokerSendThread(name: String,
                                      networkClient: NetworkClient,
@@ -42,11 +43,13 @@ abstract class InterBrokerSendThread(name: String,
     awaitShutdown()
   }
 
+  // doWork 相当于Runnable#run()方法
   override def doWork() {
     val now = time.milliseconds()
     var pollTimeout = Long.MaxValue
 
     try {
+      // 调用子类实现的generateRequests方法获取待发送的请求
       for (request: RequestAndCompletionHandler <- generateRequests()) {
         val destination = Integer.toString(request.destination.id())
         val completionHandler = request.handler

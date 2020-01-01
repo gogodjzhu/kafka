@@ -78,9 +78,13 @@ object TransactionCoordinator {
  */
 class TransactionCoordinator(brokerId: Int,
                              txnConfig: TransactionConfig,
+                             // 定时器, 负责定时启动子线程处理超时事务
                              scheduler: Scheduler,
+                             // 负责维护分发producerId
                              producerIdManager: ProducerIdManager,
+                             // 负责维护事务状态
                              txnManager: TransactionStateManager,
+                             // 负责事务完成之后, 发送Marker给broker. 内部维护的TxnStateManager跟上面的是同一个实例
                              txnMarkerChannelManager: TransactionMarkerChannelManager,
                              time: Time) extends Logging {
   this.logIdent = "[Transaction Coordinator " + brokerId + "]: "
@@ -102,6 +106,7 @@ class TransactionCoordinator(brokerId: Int,
     if (transactionalId == null) {
       // if the transactional id is null, then always blindly accept the request
       // and return a new producerId from the producerId manager
+      // 未指定transactionalId(幂等producer), 仅分配一个新的producerId即可
       val producerId = producerIdManager.generateProducerId()
       responseCallback(InitProducerIdResult(producerId, producerEpoch = 0, Errors.NONE))
     } else if (transactionalId.isEmpty) {
@@ -112,9 +117,12 @@ class TransactionCoordinator(brokerId: Int,
       // check transactionTimeoutMs is not larger than the broker configured maximum allowed value
       responseCallback(initTransactionError(Errors.INVALID_TRANSACTION_TIMEOUT))
     } else {
-      val coordinatorEpochAndMetadata = txnManager.getTransactionState(transactionalId).right.flatMap {
+      // 尝试从TransactionState获取指定transactionalId的TxnCoordinatorEpoch 和 事务状态信息Metadata，以恢复事务状态
+      val coordinatorEpochAndMetadata = txnManager.getTransactionState(transactionalId).right.flatMap { // handleInitProducerId
+        // 无事务状态信息，表示此transaction.id第一次使用, 无历史事务状态
         case None =>
           val producerId = producerIdManager.generateProducerId()
+          // 创建初始化的事务状态
           val createdMetadata = new TransactionMetadata(transactionalId = transactionalId,
             producerId = producerId,
             producerEpoch = RecordBatch.NO_PRODUCER_EPOCH,
@@ -122,6 +130,7 @@ class TransactionCoordinator(brokerId: Int,
             state = Empty,
             topicPartitions = collection.mutable.Set.empty[TopicPartition],
             txnLastUpdateTimestamp = time.milliseconds())
+          // 将事务状态信息写入缓存
           txnManager.putTransactionStateIfNotExists(transactionalId, createdMetadata)
 
         case Some(epochAndTxnMetadata) => Right(epochAndTxnMetadata)
@@ -133,6 +142,7 @@ class TransactionCoordinator(brokerId: Int,
           val txnMetadata = existingEpochAndMetadata.transactionMetadata
 
           txnMetadata.inLock {
+            // 封装TxnTransitMetadata信息(主要是填充)
             prepareInitProduceIdTransit(transactionalId, transactionTimeoutMs, coordinatorEpoch, txnMetadata)
           }
       }
@@ -152,6 +162,7 @@ class TransactionCoordinator(brokerId: Int,
               }
             }
 
+            // 结束事务, 并返回错误要求客户端重新发起事务
             handleEndTransaction(transactionalId,
               newMetadata.producerId,
               newMetadata.producerEpoch,
@@ -170,12 +181,23 @@ class TransactionCoordinator(brokerId: Int,
               }
             }
 
-            txnManager.appendTransactionToLog(transactionalId, coordinatorEpoch, newMetadata, sendPidResponseCallback)
+            // 写入事务topic
+            txnManager.appendTransactionToLog(transactionalId, coordinatorEpoch, newMetadata, sendPidResponseCallback) // handleInitProducerId
           }
       }
     }
   }
 
+  /**
+    * 准备InitProducerId请求对应的事务状态修改，包括校验从"事务状态topic"恢复的事务状态信息:
+    * - 若为 PrepareAbort, PrepareCommit 则拒绝访问. 其他实例正在准备提交或者回滚此事务
+    * - 若为 CompleteAbort, CompleteCommit 则更新producerId和producerEpoch并返回事务状态信息. 此事务状态信息已经写入topic
+    * - 若为 Ongoing 表示此事务在执行过程中被结束, 需要回滚事务, 同时epoch+1, 要求客户端重试请求
+    * - 若为 Dead, PrepareEpochFence 非法状态
+    *
+    * @param txnMetadata 从"事务状态topic恢复"的事务状态信息，若是新建的事务则为初始值
+    *
+    */
   private def prepareInitProduceIdTransit(transactionalId: String,
                                           transactionTimeoutMs: Int,
                                           coordinatorEpoch: Int,
@@ -218,6 +240,10 @@ class TransactionCoordinator(brokerId: Int,
     }
   }
 
+  /**
+    * 处理事务新增涉及Partition请求
+    * @param partitions 指定producer-事务涉及的所有partitions
+    */
   def handleAddPartitionsToTransaction(transactionalId: String,
                                        producerId: Long,
                                        producerEpoch: Short,
@@ -229,7 +255,8 @@ class TransactionCoordinator(brokerId: Int,
     } else {
       // try to update the transaction metadata and append the updated metadata to txn log;
       // if there is no such metadata treat it as invalid producerId mapping error.
-      val result: ApiResult[(Int, TxnTransitMetadata)] = txnManager.getTransactionState(transactionalId).right.flatMap {
+      // txnManager.getTransactionState()方法尝试从缓存中读取transactionalId对应的事务状态信息
+      val result: ApiResult[(Int, TxnTransitMetadata)] = txnManager.getTransactionState(transactionalId).right.flatMap { // handleAddPartitionsToTransaction
         case None => Left(Errors.INVALID_PRODUCER_ID_MAPPING)
 
         case Some(epochAndMetadata) =>
@@ -249,8 +276,11 @@ class TransactionCoordinator(brokerId: Int,
               Left(Errors.CONCURRENT_TRANSACTIONS)
             } else if (txnMetadata.state == Ongoing && partitions.subsetOf(txnMetadata.topicPartitions)) {
               // this is an optimization: if the partitions are already in the metadata reply OK immediately
+              // 此partition已经存在事务状态中， 直接返回
               Left(Errors.NONE)
             } else {
+              // 修改缓存中的事务状态信息(增加事务涉及的Partition), 并返回修改后的事务元数据(包括更新之后的事务涉及TopicPartition
+              // 列表/事务创建时间,超时时间,修改时间,etc.)
               Right(coordinatorEpoch, txnMetadata.prepareAddPartitions(partitions.toSet, time.milliseconds()))
             }
           }
@@ -262,13 +292,13 @@ class TransactionCoordinator(brokerId: Int,
           responseCallback(err)
 
         case Right((coordinatorEpoch, newMetadata)) =>
-          txnManager.appendTransactionToLog(transactionalId, coordinatorEpoch, newMetadata, responseCallback)
+          txnManager.appendTransactionToLog(transactionalId, coordinatorEpoch, newMetadata, responseCallback) // handleAddPartitionsToTransaction
       }
     }
   }
 
   def handleTxnImmigration(txnTopicPartitionId: Int, coordinatorEpoch: Int) {
-      txnManager.loadTransactionsForTxnTopicPartition(txnTopicPartitionId, coordinatorEpoch, txnMarkerChannelManager.addTxnMarkersToSend)
+      txnManager.loadTransactionsForTxnTopicPartition(txnTopicPartitionId, coordinatorEpoch, txnMarkerChannelManager.addTxnMarkersToSend) // handleTxnImmigration
   }
 
   def handleTxnEmigration(txnTopicPartitionId: Int, coordinatorEpoch: Int) {
@@ -284,6 +314,9 @@ class TransactionCoordinator(brokerId: Int,
     Left(Errors.INVALID_TXN_STATE)
   }
 
+  /**
+    * 处理事务结束
+    */
   def handleEndTransaction(transactionalId: String,
                            producerId: Long,
                            producerEpoch: Short,
@@ -292,7 +325,7 @@ class TransactionCoordinator(brokerId: Int,
     if (transactionalId == null || transactionalId.isEmpty)
       responseCallback(Errors.INVALID_REQUEST)
     else {
-      val preAppendResult: ApiResult[(Int, TxnTransitMetadata)] = txnManager.getTransactionState(transactionalId).right.flatMap {
+      val preAppendResult: ApiResult[(Int, TxnTransitMetadata)] = txnManager.getTransactionState(transactionalId).right.flatMap { // handleEndTransaction
         case None =>
           Left(Errors.INVALID_PRODUCER_ID_MAPPING)
 
@@ -307,8 +340,8 @@ class TransactionCoordinator(brokerId: Int,
               Left(Errors.INVALID_PRODUCER_EPOCH)
             else if (txnMetadata.pendingTransitionInProgress && txnMetadata.pendingState.get != PrepareEpochFence)
               Left(Errors.CONCURRENT_TRANSACTIONS)
-            else txnMetadata.state match {
-              case Ongoing =>
+            else txnMetadata.state match { // 事务状态转移 的合法性判断, 并做响应处理
+              case Ongoing => // 当前状态为ongoing, 转化为commit
                 val nextState = if (txnMarkerResult == TransactionResult.COMMIT)
                   PrepareCommit
                 else
@@ -363,7 +396,7 @@ class TransactionCoordinator(brokerId: Int,
         case Right((coordinatorEpoch, newMetadata)) =>
           def sendTxnMarkersCallback(error: Errors): Unit = {
             if (error == Errors.NONE) {
-              val preSendResult: ApiResult[(TransactionMetadata, TxnTransitMetadata)] = txnManager.getTransactionState(transactionalId).right.flatMap {
+              val preSendResult: ApiResult[(TransactionMetadata, TxnTransitMetadata)] = txnManager.getTransactionState(transactionalId).right.flatMap { // handleEndTransaction
                 case None =>
                   val errorMsg = s"The coordinator still owns the transaction partition for $transactionalId, but there is " +
                     s"no metadata in the cache; this is not expected"
@@ -416,9 +449,10 @@ class TransactionCoordinator(brokerId: Int,
                 case Right((txnMetadata, newPreSendMetadata)) =>
                   // we can respond to the client immediately and continue to write the txn markers if
                   // the log append was successful
+                  // 先响应client, 再处理txnMarker
                   responseCallback(Errors.NONE)
 
-                  txnMarkerChannelManager.addTxnMarkersToSend(transactionalId, coordinatorEpoch, txnMarkerResult, txnMetadata, newPreSendMetadata)
+                  txnMarkerChannelManager.addTxnMarkersToSend(transactionalId, coordinatorEpoch, txnMarkerResult, txnMetadata, newPreSendMetadata) // handleEndTransaction(...)
               }
             } else {
               info(s"Aborting sending of transaction markers and returning $error error to client for $transactionalId's EndTransaction request of $txnMarkerResult, " +
@@ -428,7 +462,7 @@ class TransactionCoordinator(brokerId: Int,
             }
           }
 
-          txnManager.appendTransactionToLog(transactionalId, coordinatorEpoch, newMetadata, sendTxnMarkersCallback)
+          txnManager.appendTransactionToLog(transactionalId, coordinatorEpoch, newMetadata, sendTxnMarkersCallback) // handleEndTransaction
       }
     }
   }
@@ -439,7 +473,7 @@ class TransactionCoordinator(brokerId: Int,
 
   private def abortTimedOutTransactions(): Unit = {
     txnManager.timedOutTransactions().foreach { txnIdAndPidEpoch =>
-      txnManager.getTransactionState(txnIdAndPidEpoch.transactionalId).right.flatMap {
+      txnManager.getTransactionState(txnIdAndPidEpoch.transactionalId).right.flatMap { // abortTimedOutTransactions
         case None =>
           error(s"Could not find transaction metadata when trying to timeout transaction with transactionalId " +
             s"${txnIdAndPidEpoch.transactionalId}. ProducerId: ${txnIdAndPidEpoch.producerId}. ProducerEpoch: " +
@@ -501,6 +535,7 @@ class TransactionCoordinator(brokerId: Int,
     )
     if (enableTransactionalIdExpiration)
       txnManager.enableTransactionalIdExpiration()
+    // txnMarkerChannelManager继承自InterBrokerSendThread, 这里启动此线程, 用于处理marker消息
     txnMarkerChannelManager.start()
     isActive.set(true)
 

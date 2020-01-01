@@ -55,13 +55,14 @@ class LogSegment(val log: FileRecords,
                  val timeIndex: TimeIndex,
                  val txnIndex: TransactionIndex,
                  val baseOffset: Long,
-                 val indexIntervalBytes: Int,
+                 val indexIntervalBytes: Int, // 索引插入间隔字节,默认4k
                  val rollJitterMs: Long,
                  time: Time) extends Logging {
 
   private var created = time.milliseconds
 
   /* the number of bytes since we last added an entry in the offset index */
+  // 距离上次插入索引至今新增数据的字节数(用于择机插入索引)
   private var bytesSinceLastIndexEntry = 0
 
   /* The timestamp we used for time based log rolling */
@@ -127,7 +128,7 @@ class LogSegment(val log: FileRecords,
         offsetOfMaxTimestamp = shallowOffsetOfMaxTimestamp
       }
       // append an entry to the index (if needed)
-      if(bytesSinceLastIndexEntry > indexIntervalBytes) {
+      if(bytesSinceLastIndexEntry > indexIntervalBytes) { // 超过间隔,插入稀疏索引
         index.append(firstOffset, physicalPosition)
         timeIndex.maybeAppend(maxTimestampSoFar, offsetOfMaxTimestamp)
         bytesSinceLastIndexEntry = 0
@@ -164,6 +165,8 @@ class LogSegment(val log: FileRecords,
    * The startingFilePosition argument is an optimization that can be used if we already know a valid starting position
    * in the file higher than the greatest-lower-bound from the index.
    *
+   * 寻找第一个>=offset的消息(batch)的position和size, startingFilePosition用于手动跳过搜索区间(不配置的时候默认从头开始检索(当然是结合索引从头开始检索)).
+   *
    * @param offset The offset we want to translate
    * @param startingFilePosition A lower bound on the file position from which to begin the search. This is purely an optimization and
    * when omitted, the search will begin at the position in the offset index.
@@ -172,6 +175,7 @@ class LogSegment(val log: FileRecords,
    */
   @threadsafe
   private[log] def translateOffset(offset: Long, startingFilePosition: Int = 0): LogOffsetPosition = {
+    // 利用稀疏索引
     val mapping = index.lookup(offset)
     log.searchForOffsetWithSize(offset, max(mapping.position, startingFilePosition))
   }
@@ -179,6 +183,7 @@ class LogSegment(val log: FileRecords,
   /**
    * Read a message set from this segment beginning with the first offset >= startOffset. The message set will include
    * no more than maxSize bytes and will end before maxOffset if a maxOffset is specified.
+   * 从>=startOffset开始消费数据, 满足<=maxOffset && <=maxPosition
    *
    * @param startOffset A lower bound on the first offset to include in the message set we read
    * @param maxSize The maximum number of bytes to include in the message set we read
@@ -205,8 +210,11 @@ class LogSegment(val log: FileRecords,
     val startPosition = startOffsetAndSize.position
     val offsetMetadata = new LogOffsetMetadata(startOffset, this.baseOffset, startPosition)
 
+    // 最大读取字节数
     val adjustedMaxSize =
+      // 一次fetch读取的第一个batch, 可以超过maxSize
       if (minOneMessage) math.max(maxSize, startOffsetAndSize.size)
+      // maxSize
       else maxSize
 
     // return a log segment but with zero size in the case below
@@ -214,6 +222,7 @@ class LogSegment(val log: FileRecords,
       return FetchDataInfo(offsetMetadata, MemoryRecords.EMPTY)
 
     // calculate the length of the message set to read based on whether or not they gave us a maxOffset
+    // 根据maxOffset和maxPosition计算将要从文件读取的字节数
     val fetchSize: Int = maxOffset match {
       case None =>
         // no max offset, just read until the max position
@@ -234,6 +243,7 @@ class LogSegment(val log: FileRecords,
         min(min(maxPosition, endPosition) - startPosition, adjustedMaxSize).toInt
     }
 
+    // 获取了startPosition和fetchSize, 从log文件读取内容即可
     FetchDataInfo(offsetMetadata, log.read(startPosition, fetchSize),
       firstEntryIncomplete = adjustedMaxSize < startOffsetAndSize.size)
   }

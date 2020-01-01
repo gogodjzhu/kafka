@@ -57,6 +57,12 @@ public class SubscriptionState {
     private static final String SUBSCRIPTION_EXCEPTION_MESSAGE =
             "Subscription to topics, partitions and pattern are mutually exclusive";
 
+    /**
+     * NONE: 初始值
+     * AUTO_TOPICS: 指定Topic, 具体的Partition分配由Broker实现
+     * AUTO_PATTERN: 通过正则表达式指定Topic, 具体的Partition分配由Broker实现
+     * USER_ASSIGNED: 客户端指定Topic-Partition
+     */
     private enum SubscriptionType {
         NONE, AUTO_TOPICS, AUTO_PATTERN, USER_ASSIGNED
     }
@@ -349,7 +355,7 @@ public class SubscriptionState {
     }
 
     public void needOffsetReset(TopicPartition partition) {
-        needOffsetReset(partition, defaultResetStrategy);
+        needOffsetReset(partition, defaultResetStrategy); // update with defaultStrategy
     }
 
     public boolean hasDefaultOffsetResetPolicy() {
@@ -435,7 +441,7 @@ public class SubscriptionState {
     private static class TopicPartitionState {
         private Long position; // last consumed position
         private Long highWatermark; // the high watermark from last fetch
-        private Long lastStableOffset;
+        private Long lastStableOffset; // the last stable offset (use for transactional)
         private OffsetAndMetadata committed;  // last committed position
         private boolean paused;  // whether this partition has been paused by the user
         private OffsetResetStrategy resetStrategy;  // the strategy to use if the offset needs resetting

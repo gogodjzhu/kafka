@@ -251,11 +251,12 @@ class Partition(val topic: String,
    * Update the log end offset of a certain replica of this partition
    */
   def updateReplicaLogReadResult(replicaId: Int, logReadResult: LogReadResult) {
+    // 拉取指定replicaId的副本的信息
     getReplica(replicaId) match {
       case Some(replica) =>
         // No need to calculate low watermark if there is no delayed DeleteRecordsRequest
         val oldLeaderLW = if (replicaManager.delayedDeleteRecordsPurgatory.delayed > 0) lowWatermarkIfLeader else -1L
-        replica.updateLogReadResult(logReadResult)
+        replica.updateLogReadResult(logReadResult) // 更新replica的logOffset, 这可能会影响lowWatermarkIfLeader方法的返回(即log水位变动)
         val newLeaderLW = if (replicaManager.delayedDeleteRecordsPurgatory.delayed > 0) lowWatermarkIfLeader else -1L
         // check if the LW of the partition has incremented
         // since the replica's logStartOffset may have incremented
@@ -290,6 +291,14 @@ class Partition(val topic: String,
    * whether a replica is in-sync, we only check HW.
    *
    * This function can be triggered when a replica's LEO has incremented
+   *
+   * 检查更新Isr列表
+   * 一个replica进入ISR的条件是: 此replica的LogEndOffset(LEO) >= 分区的高水位(HW)
+   * 准确地说, ISR的判定有两个标准:
+   * 1. follower的LEO是否追上leader的LEO (replica.lag.max.messages)[存在的问题是如果瞬时消息生成比消费快就会导致out Sync]
+   * 2. follower在近期发送过FetchRequest请求给Leader (replica.lag.time.max.ms)[存在的问题是如果follower频繁拉取少量数据, 会误判为inSync]
+   * 在0.9.0.0的更新中移除了replica.lag.max.messages配置, 将两个标准合并为一个:
+   * 最近一次追上leader的时间, 低于replica.lag.time.max.ms时认为inSync
    */
   def maybeExpandIsr(replicaId: Int, logReadResult: LogReadResult): Boolean = {
     inWriteLock(leaderIsrUpdateLock) {
@@ -387,6 +396,7 @@ class Partition(val topic: String,
     val newHighWatermark = allLogEndOffsets.min(new LogOffsetMetadata.OffsetOrdering)
     val oldHighWatermark = leaderReplica.highWatermark
     if (oldHighWatermark.messageOffset < newHighWatermark.messageOffset || oldHighWatermark.onOlderSegment(newHighWatermark)) {
+      // highWatermark is volatile
       leaderReplica.highWatermark = newHighWatermark
       debug(s"High watermark updated to $newHighWatermark")
       true
@@ -401,6 +411,8 @@ class Partition(val topic: String,
    * The low watermark offset value, calculated only if the local replica is the partition leader
    * It is only used by leader broker to decide when DeleteRecordsRequest is satisfied. Its value is minimum logStartOffset of all live replicas
    * Low watermark will increase when the leader broker receives either FetchRequest or DeleteRecordsRequest.
+   * 仅供Partition Leader实例使用, 获取LW offset
+   * 低水位(LW)的定义为: 所有存活的replica中的LogStartOffset最小值
    */
   def lowWatermarkIfLeader: Long = {
     if (!isLeaderReplicaLocal)
@@ -419,6 +431,9 @@ class Partition(val topic: String,
     replicaManager.tryCompleteDelayedDeleteRecords(requestKey)
   }
 
+  /**
+   * 修剪ISR列表
+   */
   def maybeShrinkIsr(replicaMaxLagTimeMs: Long) {
     val leaderHWIncremented = inWriteLock(leaderIsrUpdateLock) {
       leaderReplicaIfLocal match {
@@ -459,6 +474,10 @@ class Partition(val topic: String,
      * the last time when the replica was fully caught up. If either of the above conditions
      * is violated, that replica is considered to be out of sync
      *
+     * 存在两种需要被移出ISR的follower:
+     * - 阻塞Follower: 超过maxLagMs的时间此replica 的LEO未更新
+     * - 慢Follower: 超过maxLogMs的时间此replica未追上leader LEO
+     * 这里将两者合成一种判断: 最近replica追上leader LEO的时间若大于maxLogMs就视为outSync
      **/
     val candidateReplicas = inSyncReplicas - leaderReplica
 
@@ -474,11 +493,14 @@ class Partition(val topic: String,
       leaderReplicaIfLocal match {
         case Some(leaderReplica) =>
           val log = leaderReplica.log.get
+          // minInSyncReplicas指定了当ack配置为all或者-1的时候，leader需要等到多少个isr的replica(包括leader自身)响应才认为写入成功
           val minIsr = log.config.minInSyncReplicas
           val inSyncSize = inSyncReplicas.size
 
           // Avoid writing to leader if there are not enough insync replicas to make it safe
           if (inSyncSize < minIsr && requiredAcks == -1) {
+            // isr状态的replica不足minIsr，抛出异常
+            // PS. 如果手动配置minInSyncReplicas，需保证minInSyncReplicas小于或等于正常运行时的实际replica数量。否则永远无法成功发送
             throw new NotEnoughReplicasException("Number of insync replicas for partition %s is [%d], below required minimum [%d]"
               .format(topicPartition, inSyncSize, minIsr))
           }

@@ -339,6 +339,12 @@ public class NetworkClient implements KafkaClient {
         doSend(clientRequest, true, now);
     }
 
+    /**
+     * 发送请求(其实也不是真正的发送, 仅仅将请求添加到缓存, 待可发送事件到来才真正发送)
+     * @param clientRequest 请求
+     * @param isInternalRequest 是否为内部请求. 内部请求会自行做可发送状态检查, 本方法就不再做二次检查
+     * @param now 发送时间
+     */
     private void doSend(ClientRequest clientRequest, boolean isInternalRequest, long now) {
         String nodeId = clientRequest.destination();
         if (!isInternalRequest) {
@@ -348,7 +354,7 @@ public class NetworkClient implements KafkaClient {
             // will be slightly different for some internal requests (for
             // example, ApiVersionsRequests can be sent prior to being in
             // READY state.)
-            if (!canSendRequest(nodeId))
+            if (!canSendRequest(nodeId)) // 对非内部请求做目标broker的可发送状态检查
                 throw new IllegalStateException("Attempt to send a request to node " + nodeId + " which is not ready.");
         }
         AbstractRequest.Builder<?> builder = clientRequest.requestBuilder();
@@ -818,6 +824,9 @@ public class NetworkClient implements KafkaClient {
         }
     }
 
+    /**
+     * 维护元数据工具类, 作为NetworkClient的内部类, 可以直接使用client的资源以发送更新请求
+     */
     class DefaultMetadataUpdater implements MetadataUpdater {
 
         /* the current cluster metadata */
@@ -841,6 +850,13 @@ public class NetworkClient implements KafkaClient {
             return !this.metadataFetchInProgress && this.metadata.timeToNextUpdate(now) == 0;
         }
 
+        /**
+         * 判断是否需要更新元数据,
+         * 当前不需要更新时, 返回距离下一次更新的时间
+         * 当前需要更新时, 构造{@link MetadataRequest}请求通过{@link this#doSend(ClientRequest, boolean, long, AbstractRequest)}方法发送
+         * @param now
+         * @return
+         */
         @Override
         public long maybeUpdate(long now) {
             // should we update our metadata?
@@ -932,7 +948,7 @@ public class NetworkClient implements KafkaClient {
 
         /**
          * Add a metadata request to the list of sends if we can make one
-         * 尝试添加指向node的 "元数据更新请求"
+         * 尝试添加指向node的 "元数据更新请求"到请求队列, 返回重试时间(时间过后会再次检查是否需要重试发送).
          */
         private long maybeUpdate(long now, Node node) {
             String nodeConnectionId = node.idString();
@@ -949,6 +965,7 @@ public class NetworkClient implements KafkaClient {
 
 
                 log.debug("Sending metadata request {} to node {}", metadataRequest, node);
+                // 作为内部(internal)请求发送元数据更新请求
                 sendInternalMetadataRequest(metadataRequest, nodeConnectionId, now);
                 return requestTimeoutMs;
             }
@@ -987,6 +1004,8 @@ public class NetworkClient implements KafkaClient {
     @Override
     public ClientRequest newClientRequest(String nodeId, AbstractRequest.Builder<?> requestBuilder, long createdTimeMs,
                                           boolean expectResponse, RequestCompletionHandler callback) {
+        // correlation 即 correlationId, 用于在Client内部唯一标识一个请求
+        // clientId 是通过client.id配置的字符串, 用于在ip/port之外增加一个阅读友好的标识, 用于跟踪debug请求路径
         return new ClientRequest(nodeId, requestBuilder, correlation++, clientId, createdTimeMs, expectResponse,
                 callback);
     }

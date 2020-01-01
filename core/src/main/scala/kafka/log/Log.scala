@@ -588,7 +588,7 @@ class Log(@volatile var dir: File,
 
         if (assignOffsets) {
           // assign offsets to the message set
-          val offset = new LongRef(nextOffsetMetadata.messageOffset)
+          val offset = new LongRef(nextOffsetMetadata.messageOffset) // TODO 没看懂这个方法
           appendInfo.firstOffset = offset.value
           val now = time.milliseconds
           val validateAndOffsetAssignResult = try {
@@ -610,6 +610,7 @@ class Log(@volatile var dir: File,
           appendInfo.maxTimestamp = validateAndOffsetAssignResult.maxTimestamp
           appendInfo.offsetOfMaxTimestamp = validateAndOffsetAssignResult.shallowOffsetOfMaxTimestamp
           appendInfo.lastOffset = offset.value - 1
+          // 通过message.timestamp.type配置，标记消息的事件戳为服务器append时间
           if (config.messageTimestampType == TimestampType.LOG_APPEND_TIME)
             appendInfo.logAppendTime = now
 
@@ -647,6 +648,7 @@ class Log(@volatile var dir: File,
 
         // now that we have valid records, offsets assigned, and timestamps updated, we need to
         // validate the idempotent/transactional state of the producers and collect some metadata
+        // 这里校验producer校验 幂等/事务 的状态
         val (updatedProducers, completedTxns, maybeDuplicate) = analyzeAndValidateProducerState(validRecords, isFromClient)
         maybeDuplicate.foreach { duplicate =>
           appendInfo.firstOffset = duplicate.firstOffset
@@ -754,12 +756,14 @@ class Log(@volatile var dir: File,
     val updatedProducers = mutable.Map.empty[Long, ProducerAppendInfo]
     val completedTxns = ListBuffer.empty[CompletedTxn]
     for (batch <- records.batches.asScala if batch.hasProducerId) {
+      // 获取消息来源producer的最近一次发送记录
       val maybeLastEntry = producerStateManager.lastEntry(batch.producerId)
 
       // if this is a client produce request, there will be only one batch. If that batch matches
       // the last appended entry for that producer, then this request is a duplicate and we return
       // the last appended entry to the client.
       if (isFromClient && maybeLastEntry.exists(_.isDuplicate(batch)))
+        // 判断当前batch跟来自同一个producer的上一个batch重复，则返回重复信息
         return (updatedProducers, completedTxns.toList, maybeLastEntry)
 
       val maybeCompletedTxn = updateProducers(batch, updatedProducers, isFromClient = isFromClient)
@@ -883,6 +887,7 @@ class Log(@volatile var dir: File,
 
   /**
    * Read messages from the log.
+   * 从当前log对象拉取消息
    *
    * @param startOffset The offset to begin reading at
    * @param maxLength The maximum number of bytes to read
@@ -905,9 +910,13 @@ class Log(@volatile var dir: File,
 
     // Because we don't use lock for reading, the synchronization is a little bit tricky.
     // We create the local variables to avoid race conditions with updates to the log.
+    // 使用本地val来缓存当前的log end offset, 简单地防止数据竞争
     val currentNextOffsetMetadata = nextOffsetMetadata
     val next = currentNextOffsetMetadata.messageOffset
+
+    // 消费的startOffset和LEO相等, 即无新消息生成, 直接返回
     if (startOffset == next) {
+      // 在没有新消息生成的时候, 自然也不存在回滚的事务abortedTransactions
       val abortedTransactions =
         if (isolationLevel == IsolationLevel.READ_COMMITTED) Some(List.empty[AbortedTransaction])
         else None
@@ -915,15 +924,18 @@ class Log(@volatile var dir: File,
         abortedTransactions = abortedTransactions)
     }
 
+    // 需要关注的是segments的数据结构:ConcurrentNavigableMap. floorEntry方法的作用是返回小于等于startOffset的最大key对应的Entry(segment)
     var segmentEntry = segments.floorEntry(startOffset)
 
     // return error on attempt to read beyond the log end offset or read below log start offset
+    // offset 越界
     if (startOffset > next || segmentEntry == null || startOffset < logStartOffset)
       throw new OffsetOutOfRangeException("Request for offset %d but we only have log segments in the range %d to %d.".format(startOffset, logStartOffset, next))
 
     // Do the read on the segment with a base offset less than the target offset
     // but if that segment doesn't contain any messages with an offset greater than that
     // continue to read from successive segments until we get some messages or we reach the end of the log
+    // 以当前segment
     while(segmentEntry != null) {
       val segment = segmentEntry.getValue
 
@@ -931,7 +943,22 @@ class Log(@volatile var dir: File,
       // the message is appended but before the nextOffsetMetadata is updated. In that case the second fetch may
       // cause OffsetOutOfRangeException. To solve that, we cap the reading up to exposed position instead of the log
       // end of the active segment.
+
+      // KAFKA-2477
+      // producer写入数据到log会做两件事情:
+      // 1. 将数据持久化到log
+      // 2. 更新Log.nextOffsetMetadata.messageOffset.
+      // 由于读写之间互不加锁, 因此写入线程在1,2过程中,同时可能会有读线程在读数据. 另外, 读Log的时候必须指定startPosition和maxPosition,
+      // 此修改之前, maxPosition当maxOffset不为null时使用整个segment的结尾作为maxPosition. 在此前提下, 可能发生以下情况导致异常:
+      //  1) 写入线程W1完成消息m的持久化, log的maxSize增加, 但Log.nextOffsetMetadata未更新(假设offset为o1)
+      //  2) 读线程R1不带maxOffset参数消费数据, 因此使用当前log的maxSize作为maxPosition消费数据, 读到消息m(offset为o1+1)
+      //  3) 读线程R2继续消费而它的startOffset为o1+1, 此时Log.nextOffsetMetadata未更新仍为o1, 所以会报OffsetOutOfRangeException
+      // 这里的解决办法就是不依赖log.maxSize作为读取Log的maxPosition, 而是以Log.nextOffsetMetadata为标准计算得到的position作为maxPosition.
+      // 具体地, 在当前segments不是最后一个segments时, 需要取当前nextOffsetMetadata对应的positionInSegment作为log消费的最大位置maxPosition,
+      // 在消费的过程中哪怕有新的数据进来导致log长度增加, 也不会消费到这部分新增的数据
       val maxPosition = {
+        // nextOffsetMetadata.relativePositionInSegment保存的是在对应segment的偏移量, 如果不是lastEntry(即非active)则可以放心
+        // 使用segments.size作为maxPosition
         if (segmentEntry == segments.lastEntry) {
           val exposedPos = nextOffsetMetadata.relativePositionInSegment.toLong
           // Check the segment again in case a new segment has just rolled out.
@@ -1014,6 +1041,9 @@ class Log(@volatile var dir: File,
    *
    * `NOTE:` OffsetRequest V0 does not use this method, the behavior of OffsetRequest V0 remains the same as before
    * , i.e. it only gives back the timestamp based on the last modification time of the log segments.
+   *
+   * 返回第一个满足修改时间大于或等于targetTimestamp的消息的offset, 若无满足条件则返回logEndOffset.
+   * 注意此方法只支持V1以后的版本, V0版本对消息时间的判断基于segment文件的更新时间
    *
    * @param targetTimestamp The given timestamp for offset fetching.
    * @return The offset of the first message whose timestamp is greater than or equals to the given timestamp.

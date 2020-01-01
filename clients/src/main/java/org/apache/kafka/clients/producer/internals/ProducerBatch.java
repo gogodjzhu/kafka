@@ -120,7 +120,7 @@ public final class ProducerBatch {
             // split to several new batches and resent.
             // thunk [θʌŋk] n.形实转换程序
             // thunks保存了本Batch发送过的所有消息的元数据, 以处理batch需要重发、分裂等操作
-            // KNOWLEDGE batch重发&分裂操作?
+            // NOTE batch重发&分裂操作?
             thunks.add(new Thunk(callback, future));
             this.recordCount++;
             return future;

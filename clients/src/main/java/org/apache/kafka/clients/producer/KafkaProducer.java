@@ -252,6 +252,7 @@ public class KafkaProducer<K, V> implements Producer<K, V> {
     private final int requestTimeoutMs;
     private final ProducerInterceptors<K, V> interceptors;
     private final ApiVersions apiVersions;
+    // 事务管理器
     private final TransactionManager transactionManager;
 
     /**
@@ -529,6 +530,11 @@ public class KafkaProducer<K, V> implements Producer<K, V> {
      *   2. Gets the internal producer id and epoch, used in all future transactional
      *      messages issued by the producer.
      *
+     * 对于所有事务Producer(配置了transactional.id的), 在执行任何操作前都需要调用此方法做事务的初始化，它做了以下这些事情:
+     *   1. 保证先执行的，且拥有相同transactional.id的其他Producer实例已经执行完毕. 如果这些实例拥有失败的事务，那么直接退出; 如果
+     *      这些事务正在结束，等待它们结束.
+     *   2. 获取分配给这个实例的producerId和epoch信息, 在此会话创建的所有事务中都需使用.
+     *
      * @throws IllegalStateException if no transactional.id has been configured
      * @throws org.apache.kafka.common.errors.UnsupportedVersionException fatal error indicating the broker
      *         does not support transactions (i.e. if its version is lower than 0.11.0.0)
@@ -537,9 +543,13 @@ public class KafkaProducer<K, V> implements Producer<K, V> {
      * @throws KafkaException if the producer has encountered a previous fatal error or for any other unexpected error
      */
     public void initTransactions() {
+        // 检查TransactionManager实例存在(配置了transactional.id即会创建)
         throwIfNoTransactionManager();
+        // 构造请求添加到transactionManager.pendingRequests队列
         TransactionalRequestResult result = transactionManager.initializeTransactions();
+        // 主动唤醒sender, 处理transactionManager.pendingRequests的消息
         sender.wakeup();
+        // 等待请求执行结束
         result.await();
     }
 
@@ -557,7 +567,7 @@ public class KafkaProducer<K, V> implements Producer<K, V> {
      * @throws KafkaException if the producer has encountered a previous fatal error or for any other unexpected error
      */
     public void beginTransaction() throws ProducerFencedException {
-        throwIfNoTransactionManager();
+        throwIfNoTransactionManager(); // // 判断TransactionManager必须存在
         transactionManager.beginTransaction();
     }
 
@@ -800,10 +810,8 @@ public class KafkaProducer<K, V> implements Producer<K, V> {
             // 回调方法
             Callback interceptCallback = this.interceptors == null ? callback : new InterceptorCallback<>(callback, this.interceptors, tp);
 
-            // 事务管理
-            // KNOWLEDGE 事务原理?
             if (transactionManager != null && transactionManager.isTransactional())
-                transactionManager.maybeAddPartitionToTransaction(tp);
+                transactionManager.maybeAddPartitionToTransaction(tp); // 若为此事务新涉及的分区需要通知TxnCoordinator
 
             // 将消息添加到缓存队列中
             RecordAccumulator.RecordAppendResult result = accumulator.append(tp, timestamp, serializedKey,
@@ -811,7 +819,6 @@ public class KafkaProducer<K, V> implements Producer<K, V> {
             // 缓存满了则唤醒sender做数据发送
             if (result.batchIsFull || result.newBatchCreated) {
                 log.trace("Waking up the sender since topic {} partition {} is either full or getting a new batch", record.topic(), partition);
-                // KNOWLEDGE 队列唤醒策略?
                 this.sender.wakeup();
             }
             return result.future;

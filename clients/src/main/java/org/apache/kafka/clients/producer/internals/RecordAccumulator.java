@@ -199,7 +199,7 @@ public final class RecordAccumulator {
                                      long maxTimeToBlock) throws InterruptedException {
         // We keep track of the number of appending thread to make sure we do not miss batches in
         // abortIncompleteBatches().
-        // 记录正在调用append方法的线程数, 记录此数值以处理防止数据丢失 KNOWLEDGE how?
+        // 记录正在调用append方法的线程数, 记录此数值以处理防止数据丢失 NOTE how?
         appendsInProgress.incrementAndGet();
         ByteBuffer buffer = null;
         if (headers == null) headers = Record.EMPTY_HEADERS;
@@ -526,11 +526,13 @@ public final class RecordAccumulator {
                                             // the previous attempt may actually have been accepted, and if we change
                                             // the producer id and sequence here, this attempt will also be accepted,
                                             // causing a duplicate.
+                                            // 第一次发送，且有事务管理器，那么给此batch设置一个sequenceNumber，用于防止重复发送
+                                            // sequenceNumber的生成策略是简单的加全局锁，事实上此方法只会被Sender线程调用，并发不高
                                             int sequenceNumber = transactionManager.sequenceNumber(batch.topicPartition);
                                             log.debug("Assigning sequence number {} from producer {} to dequeued " +
                                                             "batch from partition {} bound for {}.",
                                                     sequenceNumber, producerIdAndEpoch, batch.topicPartition, node);
-                                            batch.setProducerState(producerIdAndEpoch, sequenceNumber, isTransactional);
+                                            batch.setProducerState(producerIdAndEpoch, 0, isTransactional);
                                         }
                                         // 关闭此batch，防止仍有消息写入
                                         batch.close();

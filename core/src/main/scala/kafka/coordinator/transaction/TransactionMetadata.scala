@@ -79,8 +79,8 @@ private[transaction] case object Dead extends TransactionState { val byte: Byte 
 
 /**
   * We are in the middle of bumping the epoch and fencing out older producers.
+  * 此事务状态意味着事务epoch已经增加, 要求踢出仍在使用旧epoch的producer
   */
-
 private[transaction] case object PrepareEpochFence extends TransactionState { val byte: Byte = 7}
 
 private[transaction] object TransactionMetadata {
@@ -165,6 +165,24 @@ private[transaction] class TransactionMetadata(val transactionalId: String,
   // pending state is used to indicate the state that this transaction is going to
   // transit to, and for blocking future attempts to transit it again if it is not legal;
   // initialized as the same as the current state
+  /**
+    * pendingState 用来指示事务即将转移成的状, 使用的目的是为了多个事务Producer实例同时操作一个事务时的并发安全
+    * 因为获取状态和修改状态不是原子操作,
+    * 例如调用 TransactionCoordinator#handleInitProducerId(), TransactionCoordinator#handleAddPartitionsToTransaction()等
+    * 方法更新事务状态均包含两个步骤:
+    * 1.TransactionStateManager#getTransactionState(transactionId:String) : TransactionMetadata 从缓存获取事务状态
+    * 2.TransactionMetadata@prepareTransitionTo() : TxnTransitMetadata 修改事务状态(得到中间状态TransitMetadata)
+    * 3.TransactionStateManager#appendTransactionToLog(newMetadata:TxnTransitMetadata) 将更新后的状态写回缓存(完成事务Topic
+    * 的持久化之后)
+    * 整个方法不加锁会存在数据竞争的问题. 使用pendingState之后增加了下面几个子步骤来保证对TransactionMetadata修改的并发安全.
+    * 2.a. 检查TransactionMetadata状态是否可以修改(源状态及目标状态合法性校验), 不合法则直接退出
+    * 2.b. lock(TransactionMetadata), 锁住状态单线程修改
+    * 2.c. 检查pendingState状态是否为空, 为空表示有其他线程在修改事务状态, 抛出异常; 否则生成TxnTransitMetadata封装修改后的状态信息,
+    *    并将pendingState置为 修改的目标状态表示此线程在修改状态.
+    * 2.d. unlock(TransactionMetadata), 释放锁. 但在当前线程将pendingState恢复为空之前其他线程同样无法修改事务状态
+    * 3.a. 同3
+    * 3.b. 将pendingState恢复为空 (在TransactionMatadata#completeTransitionTo()方法最后完成)
+    */
   var pendingState: Option[TransactionState] = None
 
   private[transaction] val lock = new ReentrantLock
@@ -189,11 +207,14 @@ private[transaction] class TransactionMetadata(val transactionalId: String,
     TxnTransitMetadata(producerId, producerEpoch, txnTimeoutMs, state, topicPartitions.toSet, txnStartTimestamp, txnLastUpdateTimestamp)
   }
 
+  /**
+    * 封装一个TxnTransitMetadata, 更新producerEpoch, 让客户端重新获取producerEpoch
+    */
   def prepareFenceProducerEpoch(): TxnTransitMetadata = {
     if (producerEpoch == Short.MaxValue)
       throw new IllegalStateException(s"Cannot fence producer with epoch equal to Short.MaxValue since this would overflow")
 
-    prepareTransitionTo(PrepareEpochFence, producerId, (producerEpoch + 1).toShort, txnTimeoutMs, topicPartitions.toSet,
+    prepareTransitionTo(PrepareEpochFence, producerId, (producerEpoch + 1).toShort, txnTimeoutMs, topicPartitions.toSet, // prepareFenceProducerEpoch
       txnStartTimestamp, txnLastUpdateTimestamp)
   }
 
@@ -202,14 +223,14 @@ private[transaction] class TransactionMetadata(val transactionalId: String,
       throw new IllegalStateException(s"Cannot allocate any more producer epochs for producerId $producerId")
 
     val nextEpoch = if (producerEpoch == RecordBatch.NO_PRODUCER_EPOCH) 0 else producerEpoch + 1
-    prepareTransitionTo(Empty, producerId, nextEpoch.toShort, newTxnTimeoutMs, immutable.Set.empty[TopicPartition], -1,
+    prepareTransitionTo(Empty, producerId, nextEpoch.toShort, newTxnTimeoutMs, immutable.Set.empty[TopicPartition], -1, // prepareIncrementProducerEpoch
       updateTimestamp)
   }
 
   def prepareProducerIdRotation(newProducerId: Long, newTxnTimeoutMs: Int, updateTimestamp: Long): TxnTransitMetadata = {
     if (hasPendingTransaction)
       throw new IllegalStateException("Cannot rotate producer ids while a transaction is still pending")
-    prepareTransitionTo(Empty, newProducerId, 0, newTxnTimeoutMs, immutable.Set.empty[TopicPartition], -1, updateTimestamp)
+    prepareTransitionTo(Empty, newProducerId, 0, newTxnTimeoutMs, immutable.Set.empty[TopicPartition], -1, updateTimestamp) // prepareProducerIdRotation
   }
 
   def prepareAddPartitions(addedTopicPartitions: immutable.Set[TopicPartition], updateTimestamp: Long): TxnTransitMetadata = {
@@ -218,23 +239,23 @@ private[transaction] class TransactionMetadata(val transactionalId: String,
       case _ => txnStartTimestamp
     }
 
-    prepareTransitionTo(Ongoing, producerId, producerEpoch, txnTimeoutMs, (topicPartitions ++ addedTopicPartitions).toSet,
+    prepareTransitionTo(Ongoing, producerId, producerEpoch, txnTimeoutMs, (topicPartitions ++ addedTopicPartitions).toSet, // prepareAddPartitions
       newTxnStartTimestamp, updateTimestamp)
   }
 
   def prepareAbortOrCommit(newState: TransactionState, updateTimestamp: Long): TxnTransitMetadata = {
-    prepareTransitionTo(newState, producerId, producerEpoch, txnTimeoutMs, topicPartitions.toSet, txnStartTimestamp,
+    prepareTransitionTo(newState, producerId, producerEpoch, txnTimeoutMs, topicPartitions.toSet, txnStartTimestamp, // prepareAbortOrCommit
       updateTimestamp)
   }
 
   def prepareComplete(updateTimestamp: Long): TxnTransitMetadata = {
     val newState = if (state == PrepareCommit) CompleteCommit else CompleteAbort
-    prepareTransitionTo(newState, producerId, producerEpoch, txnTimeoutMs, Set.empty[TopicPartition], txnStartTimestamp,
+    prepareTransitionTo(newState, producerId, producerEpoch, txnTimeoutMs, Set.empty[TopicPartition], txnStartTimestamp, // prepareComplete
       updateTimestamp)
   }
 
   def prepareDead(): TxnTransitMetadata = {
-    prepareTransitionTo(Dead, producerId, producerEpoch, txnTimeoutMs, Set.empty[TopicPartition], txnStartTimestamp,
+    prepareTransitionTo(Dead, producerId, producerEpoch, txnTimeoutMs, Set.empty[TopicPartition], txnStartTimestamp, // prepareDead
       txnLastUpdateTimestamp)
   }
 
@@ -251,6 +272,9 @@ private[transaction] class TransactionMetadata(val transactionalId: String,
     }
   }
 
+  /**
+    * 封装TxnTransitMetadata对象
+    */
   private def prepareTransitionTo(newState: TransactionState,
                                   newProducerId: Long,
                                   newEpoch: Short,
@@ -281,6 +305,10 @@ private[transaction] class TransactionMetadata(val transactionalId: String,
     }
   }
 
+  /**
+    * 按照TxnTransitMetadata更新当前TxnMetadata的信息, 并清空pendingState
+    * @param transitMetadata
+    */
   def completeTransitionTo(transitMetadata: TxnTransitMetadata): Unit = {
     // metadata transition is valid only if all the following conditions are met:
     //
@@ -367,7 +395,7 @@ private[transaction] class TransactionMetadata(val transactionalId: String,
 
       debug(s"TransactionalId $transactionalId complete transition from $state to $transitMetadata")
       txnLastUpdateTimestamp = transitMetadata.txnLastUpdateTimestamp
-      pendingState = None
+      pendingState = None // 状态修改完成, 清空pendingState, 下一个事务修改方可继续操作
       state = toState
     }
   }

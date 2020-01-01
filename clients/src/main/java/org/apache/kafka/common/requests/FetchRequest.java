@@ -107,14 +107,17 @@ public class FetchRequest extends AbstractRequest {
         private final IsolationLevel isolationLevel;
         private int maxBytes = DEFAULT_RESPONSE_MAX_BYTES;
 
+        /** Consumer向partition leader发起消费的数据请求, 这里未指定IsolationLevel, 默认读ReadUncommitted*/
         public static Builder forConsumer(int maxWait, int minBytes, LinkedHashMap<TopicPartition, PartitionData> fetchData) {
             return new Builder(null, CONSUMER_REPLICA_ID, maxWait, minBytes, fetchData, IsolationLevel.READ_UNCOMMITTED);
         }
 
+        /** Consumer向partition leader发起消费的数据请求*/
         public static Builder forConsumer(int maxWait, int minBytes, LinkedHashMap<TopicPartition, PartitionData> fetchData, IsolationLevel isolationLevel) {
             return new Builder(null, CONSUMER_REPLICA_ID, maxWait, minBytes, fetchData, isolationLevel);
         }
 
+        /** partition follower向partition leader发起消费的数据请求*/
         public static Builder forReplica(short desiredVersion, int replicaId, int maxWait, int minBytes,
                                          LinkedHashMap<TopicPartition, PartitionData> fetchData) {
             return new Builder(desiredVersion, replicaId, maxWait, minBytes, fetchData, IsolationLevel.READ_UNCOMMITTED);

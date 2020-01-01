@@ -47,6 +47,13 @@ import kafka.common.InvalidOffsetException
  * 
  * All external APIs translate from relative offsets to full offsets, so users of this class do not interact with the internal 
  * storage format.
+ *
+ * 单个(segment)文件内的 offset->物理偏移 索引
+ * 通过mmap读写文件, 支持读写/只读两种模式
+ * 文件格式简单, 为: 4byte保存相对偏移offset + 4byte物理字节偏移
+ * 所谓相对偏移的意思是相对与本文件的baseOffset的相对值, 比如一个offset为55的消息保存在startOffset为50的索引文件中, 此索引保存的相
+ * 对偏移offset则为5. 物理偏移同理.
+ *
  */
 class OffsetIndex(file: File, baseOffset: Long, maxIndexSize: Int = -1, writable: Boolean = true)
     extends AbstractIndex[Long, Int](file, baseOffset, maxIndexSize, writable) {

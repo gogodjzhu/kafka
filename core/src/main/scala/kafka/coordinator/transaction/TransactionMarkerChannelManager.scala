@@ -118,6 +118,15 @@ class TxnMarkerQueue(@volatile var destination: Node) {
   def totalNumMarkers(txnTopicPartition: Int): Int = markersPerTxnTopicPartition.get(txnTopicPartition).fold(0)(_.size)
 }
 
+/**
+  * TransactionMarkerChannelManager负责定时维护Marker请求的发送
+  * 从参数列表和继承关系可以猜想出它的运行逻辑:
+  * 1. 从config读取配置信息, 决定一些运行参数
+  * 2. 从metadataCache获取已提交的事务状态信息
+  * 3. 从txnStateManager获取TopicPartition的broker信息
+  * 4. 通过networkClient完成跟topicPartition leader broker的通信
+  * 5. 继承自InterBrokerSendThread意味着上述操作通过线程的方式独立运行
+  */
 class TransactionMarkerChannelManager(config: KafkaConfig,
                                       metadataCache: MetadataCache,
                                       networkClient: NetworkClient,
@@ -131,6 +140,7 @@ class TransactionMarkerChannelManager(config: KafkaConfig,
 
   private val markersQueuePerBroker: concurrent.Map[Int, TxnMarkerQueue] = new ConcurrentHashMap[Int, TxnMarkerQueue]().asScala
 
+  // 因leader broker状态不为alive而中断发送的marker, 线程定时重发
   private val markersQueueForUnknownBroker = new TxnMarkerQueue(Node.noNode)
 
   private val txnLogAppendRetryQueue = new LinkedBlockingQueue[TxnLogAppend]()
@@ -183,13 +193,19 @@ class TransactionMarkerChannelManager(config: KafkaConfig,
     txnLogAppendRetryQueue.drainTo(txnLogAppendRetries)
     txnLogAppendRetries.asScala.foreach { txnLogAppend =>
       debug(s"Retry appending $txnLogAppend transaction log")
-      tryAppendToLog(txnLogAppend)
+      tryAppendToLog(txnLogAppend) // retryLogAppends
     }
   }
 
+  /**
+    * InterBrokerSendThread#generateRequests方法的实现，拉取TxnMarker请求
+    */
   private[transaction] def drainQueuedTransactionMarkers(): Iterable[RequestAndCompletionHandler] = {
     retryLogAppends()
     val txnIdAndMarkerEntries: java.util.List[TxnIdAndMarkerEntry] = new util.ArrayList[TxnIdAndMarkerEntry]()
+
+    /**取出markersQueueForUnknownBroker保存的Marker请求实例(这些实例在之前的发送中因为leader节点notAlive无法发送), 重试发送*/
+
     markersQueueForUnknownBroker.forEachTxnTopicPartition { case (_, queue) =>
       queue.drainTo(txnIdAndMarkerEntries)
     }
@@ -202,9 +218,14 @@ class TransactionMarkerChannelManager(config: KafkaConfig,
       val coordinatorEpoch = txnIdAndMarker.txnMarkerEntry.coordinatorEpoch
       val topicPartitions = txnIdAndMarker.txnMarkerEntry.partitions.asScala.toSet
 
-      addTxnMarkersToBrokerQueue(transactionalId, producerId, producerEpoch, txnResult, coordinatorEpoch, topicPartitions)
+      // 拆散txnIdAndMarker, 重新尝试添加到marker发送队列(也就是下面的markersQueuePerBroker队列)
+      addTxnMarkersToBrokerQueue(transactionalId, producerId, producerEpoch, // drainQueuedTransactionMarkers
+        txnResult, coordinatorEpoch, topicPartitions)
     }
 
+    // 目标leader broker节点信息正常的marker集合map
+    // 下面的一些转换比较绕, 简单来说就是将marker构造成 RequestAndCompletionHandler 集合, 这个Handler包含了一个
+    // WriteTxnMarkersRequest请求和这个请求将被发往的目标partitionLeader broker节点
     markersQueuePerBroker.values.map { brokerRequestQueue =>
       val txnIdAndMarkerEntries = new util.ArrayList[TxnIdAndMarkerEntry]()
       brokerRequestQueue.forEachTxnTopicPartition { case (_, queue) =>
@@ -218,6 +239,9 @@ class TransactionMarkerChannelManager(config: KafkaConfig,
     }
   }
 
+  /**
+    * 将事务状态添加到当前队列，封装成Marker请求等待发送
+    */
   def addTxnMarkersToSend(transactionalId: String,
                           coordinatorEpoch: Int,
                           txnResult: TransactionResult,
@@ -244,7 +268,7 @@ class TransactionMarkerChannelManager(config: KafkaConfig,
               if (epochAndMetadata.coordinatorEpoch == coordinatorEpoch) {
                 debug(s"Sending $transactionalId's transaction markers for $txnMetadata with coordinator epoch $coordinatorEpoch succeeded, trying to append complete transaction log now")
 
-                tryAppendToLog(TxnLogAppend(transactionalId, coordinatorEpoch, txnMetadata, newMetadata))
+                tryAppendToLog(TxnLogAppend(transactionalId, coordinatorEpoch, txnMetadata, newMetadata)) // addTxnMarkersToSend
               } else {
                 info(s"The cached metadata $txnMetadata has changed to $epochAndMetadata after completed sending the markers with coordinator " +
                   s"epoch $coordinatorEpoch; abort transiting the metadata to $newMetadata as it may have been updated by another process")
@@ -267,7 +291,8 @@ class TransactionMarkerChannelManager(config: KafkaConfig,
     val delayedTxnMarker = new DelayedTxnMarker(txnMetadata, appendToLogCallback, txnStateManager.stateReadLock)
     txnMarkerPurgatory.tryCompleteElseWatch(delayedTxnMarker, Seq(transactionalId))
 
-    addTxnMarkersToBrokerQueue(transactionalId, txnMetadata.producerId, txnMetadata.producerEpoch, txnResult, coordinatorEpoch, txnMetadata.topicPartitions.toSet)
+    addTxnMarkersToBrokerQueue(transactionalId, txnMetadata.producerId, // addTxnMarkersToSend
+      txnMetadata.producerEpoch, txnResult, coordinatorEpoch, txnMetadata.topicPartitions.toSet)
   }
 
   private def tryAppendToLog(txnLogAppend: TxnLogAppend) = {
@@ -297,29 +322,37 @@ class TransactionMarkerChannelManager(config: KafkaConfig,
           throw new IllegalStateException(errorMsg)
       }
 
-    txnStateManager.appendTransactionToLog(txnLogAppend.transactionalId, txnLogAppend.coordinatorEpoch, txnLogAppend.newMetadata, appendCallback,
+    txnStateManager.appendTransactionToLog(txnLogAppend.transactionalId, // tryAppendToLog()
+      txnLogAppend.coordinatorEpoch, txnLogAppend.newMetadata, appendCallback,
       _ == Errors.COORDINATOR_NOT_AVAILABLE)
   }
 
   def addTxnMarkersToBrokerQueue(transactionalId: String, producerId: Long, producerEpoch: Short,
                                  result: TransactionResult, coordinatorEpoch: Int,
                                  topicPartitions: immutable.Set[TopicPartition]): Unit = {
+    // 事务Topic中保存此事务状态的Partition
     val txnTopicPartition = txnStateManager.partitionFor(transactionalId)
+
+    // 按照partitionLeader节点为键组织所有Partition成map, 同时也做了leader节点的状态检查(如果节点状态正常键为Some(node), 节点不
+    // 正常NotAlive键为Some(Node.noNode), 若找不到目标节点键为None)
     val partitionsByDestination: immutable.Map[Option[Node], immutable.Set[TopicPartition]] = topicPartitions.groupBy { topicPartition: TopicPartition =>
       metadataCache.getPartitionLeaderEndpoint(topicPartition.topic, topicPartition.partition, interBrokerListenerName)
     }
 
     for ((broker: Option[Node], topicPartitions: immutable.Set[TopicPartition]) <- partitionsByDestination) {
       broker match {
-        case Some(brokerNode) =>
+        case Some(brokerNode) => // brokerNode是指定topicPartition的leader节点
+          // 将发往同一个leader节点的多个partition通过一个marker发送
           val marker = new TxnMarkerEntry(producerId, producerEpoch, coordinatorEpoch, result, topicPartitions.toList.asJava)
           val txnIdAndMarker = TxnIdAndMarkerEntry(transactionalId, marker)
 
           if (brokerNode == Node.noNode) {
             // if the leader of the partition is known but node not available, put it into an unknown broker queue
             // and let the sender thread to look for its broker and migrate them later
+            // leader节点当前状态不为alive, 将marker信息添加到unknownBroker队列, TxnMarkerChannelManager会定时检查此队列, 重试发送
             markersQueueForUnknownBroker.addMarkers(txnTopicPartition, txnIdAndMarker)
           } else {
+            // leader broker 信息存在且为alive, 将marker添加到待发送队列
             addMarkersForBroker(brokerNode, txnTopicPartition, txnIdAndMarker)
           }
 

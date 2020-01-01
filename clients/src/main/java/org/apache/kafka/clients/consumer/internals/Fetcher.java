@@ -89,6 +89,7 @@ import static org.apache.kafka.common.serialization.ExtendedDeserializer.Wrapper
 
 /**
  * This class manage the fetching process with the brokers.
+ * 处理从broker拉取消息的操作, 类似Producer的Sender
  */
 public class Fetcher<K, V> implements SubscriptionState.Listener, Closeable {
 
@@ -96,17 +97,24 @@ public class Fetcher<K, V> implements SubscriptionState.Listener, Closeable {
 
     private final ConsumerNetworkClient client;
     private final Time time;
+
+    // 一个fetch请求broker最少应该返回的消息字节数. 当broker无法获取足够的消息返回时, 会尝试等待新消息. 通过fetch.min.bytes配置,
+    // 默认为1.
     private final int minBytes;
+
+    // 一个fetch请求broker返回客户端的最大字节数. 但当一次请求遇到的第一个record就大于此值, 会破例返回.
+    // 此参数是在 fetchSize 参数之后出现的, 这是因为fetchSize控制的是单个partition的返回大小, 但一次fetch涉及多个partition(返回
+    // 消息的最大值为fetchSize * numPartition)会使得返回消息的体积很大. 于是乎在KIP-74增加此参数以限制单个fetch的返回值
     private final int maxBytes;
     private final int maxWaitMs;
-    private final int fetchSize;
+    private final int fetchSize; // 准确地说应该是maxPartitionFetchSize, 通过max.partition.fetch.bytes配置, 控制单个Partition一次返回客户端的消息最大值
     private final long retryBackoffMs;
     private final int maxPollRecords;
     private final boolean checkCrcs;
-    private final Metadata metadata;
+    private final Metadata metadata; // Topic/Partition/PartitionInfo metadata
     private final FetchManagerMetrics sensors;
     private final SubscriptionState subscriptions;
-    private final ConcurrentLinkedQueue<CompletedFetch> completedFetches;
+    private final ConcurrentLinkedQueue<CompletedFetch> completedFetches; // FetchRequest返回的内容在这里暂存
     private final BufferSupplier decompressionBufferSupplier = BufferSupplier.create();
 
     private final ExtendedDeserializer<K> keyDeserializer;
@@ -190,6 +198,7 @@ public class Fetcher<K, V> implements SubscriptionState.Listener, Closeable {
     /**
      * Set-up a fetch request for any node that we have assigned partitions for which doesn't already have
      * an in-flight fetch or pending fetch data.
+     * 向所有已订阅且无in-flight请求的PartitionLeader发送FetchRequest
      * @return number of fetches sent
      */
     public int sendFetches() {
@@ -514,15 +523,18 @@ public class Fetcher<K, V> implements SubscriptionState.Listener, Closeable {
      */
     public Map<TopicPartition, List<ConsumerRecord<K, V>>> fetchedRecords() {
         Map<TopicPartition, List<ConsumerRecord<K, V>>> fetched = new HashMap<>();
-        int recordsRemaining = maxPollRecords;
+        int recordsRemaining = maxPollRecords; /**一次poll最多拉取的记录数, 通过{@link ConsumerConfig#MAX_POLL_RECORDS_CONFIG}配置, 默认为500*/
 
         try {
             while (recordsRemaining > 0) {
                 if (nextInLineRecords == null || nextInLineRecords.isFetched) {
+                    // FetchRequest 的返回内容在此队列缓存
                     CompletedFetch completedFetch = completedFetches.peek();
                     if (completedFetch == null) break;
 
+                    // 解析completedFetch为nextInLineRecords.
                     nextInLineRecords = parseCompletedFetch(completedFetch);
+                    // 队列中清除
                     completedFetches.poll();
                 } else {
                     List<ConsumerRecord<K, V>> records = fetchRecords(nextInLineRecords, recordsRemaining);
@@ -563,7 +575,7 @@ public class Fetcher<K, V> implements SubscriptionState.Listener, Closeable {
                 // this can happen when a partition is paused before fetched records are returned to the consumer's poll call
                 log.debug("Not returning fetched records for assigned partition {} since it is no longer fetchable",
                         partitionRecords.partition);
-            } else if (partitionRecords.nextFetchOffset == position) {
+            } else if (partitionRecords.nextFetchOffset == position) { // 返回消息的position必须跟最近请求的消息offset相等
                 List<ConsumerRecord<K, V>> partRecords = partitionRecords.fetchRecords(maxRecords);
 
                 long nextOffset = partitionRecords.nextFetchOffset;
@@ -764,12 +776,14 @@ public class Fetcher<K, V> implements SubscriptionState.Listener, Closeable {
     /**
      * Create fetch requests for all nodes for which we have assigned partitions
      * that have no existing requests in flight.
+     * 创建指向所有已订阅partition(leader node)的FetchRequest.Builder
      */
     private Map<Node, FetchRequest.Builder> createFetchRequests() {
         // create the fetch info
         Cluster cluster = metadata.fetch();
         Map<Node, LinkedHashMap<TopicPartition, FetchRequest.PartitionData>> fetchable = new LinkedHashMap<>();
         for (TopicPartition partition : fetchablePartitions()) {
+            // 只向PartitionLeader发起请求
             Node node = cluster.leaderFor(partition);
             if (node == null) {
                 metadata.requestUpdate();
@@ -781,7 +795,9 @@ public class Fetcher<K, V> implements SubscriptionState.Listener, Closeable {
                     fetchable.put(node, fetch);
                 }
 
+                // 指向目标partition的消费offset. 这里是从本地缓存读取的, 能这样做是因为单个partition同一时间只能由一个consumer消费(无其他consumer会修改进度)
                 long position = this.subscriptions.position(partition);
+                // 请求包含的信息非常简单的: offset, fetchSize
                 fetch.put(partition, new FetchRequest.PartitionData(position, FetchRequest.INVALID_LOG_START_OFFSET,
                         this.fetchSize));
                 log.debug("Added {} fetch request for partition {} at offset {} to node {}", isolationLevel,
@@ -834,6 +850,11 @@ public class Fetcher<K, V> implements SubscriptionState.Listener, Closeable {
                 partitionRecords = new PartitionRecords(tp, completedFetch, batches);
 
                 if (!batches.hasNext() && partition.records.sizeInBytes() > 0) {
+                    /**
+                     * 通过{@link ConsumerConfig#MAX_PARTITION_FETCH_BYTES_CONFIG} 控制每个partition在单次fetch请求中返回消
+                     * 息的最大字节数, 当partition内单个record大于此值的时候会返回空. 但此问题在Version3中通过引入fetch.max.bytes配
+                     * 置解决.
+                     */
                     if (completedFetch.responseVersion < 3) {
                         // Implement the pre KIP-74 behavior of throwing a RecordTooLargeException.
                         Map<TopicPartition, Long> recordTooLargePartitions = Collections.singletonMap(tp, fetchOffset);

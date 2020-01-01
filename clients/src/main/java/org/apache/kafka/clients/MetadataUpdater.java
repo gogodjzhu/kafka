@@ -43,6 +43,7 @@ interface MetadataUpdater {
     /**
      * Starts a cluster metadata update if needed and possible. Returns the time until the metadata update (which would
      * be 0 if an update has been started as a result of this call).
+     * 在需要的时候启动一个元数据更新操作, 返回距离下次更新的时间, 返回0时表示本地调用已经启动了更新操作
      *
      * If the implementation relies on `NetworkClient` to send requests, `handleCompletedMetadataResponse` will be
      * invoked after the metadata response is received.

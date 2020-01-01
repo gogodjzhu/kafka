@@ -551,6 +551,7 @@ public class KafkaConsumer<K, V> implements Consumer<K, V> {
     final Metrics metrics;
 
     private final String clientId;
+    // 维护consumer状态, 包括发送consumer心跳, 检测rebalance 等等
     private final ConsumerCoordinator coordinator;
     private final Deserializer<K> keyDeserializer;
     private final Deserializer<V> valueDeserializer;
@@ -641,9 +642,9 @@ public class KafkaConsumer<K, V> implements Consumer<K, V> {
                           Deserializer<V> valueDeserializer) {
         try {
             log.debug("Starting the Kafka consumer");
-            this.requestTimeoutMs = config.getInt(ConsumerConfig.REQUEST_TIMEOUT_MS_CONFIG);
-            int sessionTimeOutMs = config.getInt(ConsumerConfig.SESSION_TIMEOUT_MS_CONFIG);
-            int fetchMaxWaitMs = config.getInt(ConsumerConfig.FETCH_MAX_WAIT_MS_CONFIG);
+            this.requestTimeoutMs = config.getInt(ConsumerConfig.REQUEST_TIMEOUT_MS_CONFIG); // 请求超时时间
+            int sessionTimeOutMs = config.getInt(ConsumerConfig.SESSION_TIMEOUT_MS_CONFIG); // 会话超时时间
+            int fetchMaxWaitMs = config.getInt(ConsumerConfig.FETCH_MAX_WAIT_MS_CONFIG); // 最大拉取消息时间 // TODO 以上三个时间的区别在哪里?
             if (this.requestTimeoutMs <= sessionTimeOutMs || this.requestTimeoutMs <= fetchMaxWaitMs)
                 throw new ConfigException(ConsumerConfig.REQUEST_TIMEOUT_MS_CONFIG + " should be greater than " + ConsumerConfig.SESSION_TIMEOUT_MS_CONFIG + " and " + ConsumerConfig.FETCH_MAX_WAIT_MS_CONFIG);
             this.time = Time.SYSTEM;
@@ -715,7 +716,7 @@ public class KafkaConsumer<K, V> implements Consumer<K, V> {
             this.client = new ConsumerNetworkClient(netClient, metadata, time, retryBackoffMs,
                     config.getInt(ConsumerConfig.REQUEST_TIMEOUT_MS_CONFIG));
             OffsetResetStrategy offsetResetStrategy = OffsetResetStrategy.valueOf(config.getString(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG).toUpperCase(Locale.ROOT));
-            this.subscriptions = new SubscriptionState(offsetResetStrategy);
+            this.subscriptions = new SubscriptionState(offsetResetStrategy); // 订阅状态, 这是负责维护订阅topicPartition和管理消费进度的核心类
             List<PartitionAssignor> assignors = config.getConfiguredInstances(
                     ConsumerConfig.PARTITION_ASSIGNMENT_STRATEGY_CONFIG,
                     PartitionAssignor.class);
@@ -741,7 +742,7 @@ public class KafkaConsumer<K, V> implements Consumer<K, V> {
                     config.getInt(ConsumerConfig.FETCH_MAX_BYTES_CONFIG),
                     config.getInt(ConsumerConfig.FETCH_MAX_WAIT_MS_CONFIG),
                     config.getInt(ConsumerConfig.MAX_PARTITION_FETCH_BYTES_CONFIG),
-                    config.getInt(ConsumerConfig.MAX_POLL_RECORDS_CONFIG),
+                    config.getInt(ConsumerConfig.MAX_POLL_RECORDS_CONFIG), // 一次poll最多拉取的record数量, 默认500
                     config.getBoolean(ConsumerConfig.CHECK_CRCS_CONFIG),
                     this.keyDeserializer,
                     this.valueDeserializer,
@@ -844,6 +845,11 @@ public class KafkaConsumer<K, V> implements Consumer<K, V> {
      * <li>A new member is added to an existing consumer group via the join API
      * </ul>
      * <p>
+     * group会在以下情况触发rebalance
+     * - group注册的topic数变化
+     * - group注册的任意topic的分区数变化
+     * - group内的消费者变化(新的进来 或者 旧的挂了)
+     *
      * When any of these events are triggered, the provided listener will be invoked first to indicate that
      * the consumer's assignment has been revoked, and then again when the new assignment has been received.
      * Note that this listener will immediately override any listener set in a previous call to subscribe.
@@ -1028,7 +1034,7 @@ public class KafkaConsumer<K, V> implements Consumer<K, V> {
      */
     @Override
     public ConsumerRecords<K, V> poll(long timeout) {
-        acquire();
+        acquire(); /**通过{@link this#currentThread}的CAS操作实现加锁, 对于并发调用此方法的操作直接抛出异常, 因为consumer的消费操作无法做到并发安全*/
         try {
             if (timeout < 0)
                 throw new IllegalArgumentException("Timeout must not be negative");
@@ -1048,9 +1054,10 @@ public class KafkaConsumer<K, V> implements Consumer<K, V> {
                     //
                     // NOTE: since the consumed position has already been updated, we must not allow
                     // wakeups or any other errors to be triggered prior to returning the fetched records.
-                    if (fetcher.sendFetches() > 0 || client.hasPendingRequests())
+                    if (fetcher.sendFetches() > 0 || client.hasPendingRequests()) // poll() after pollOnce()
                         client.pollNoWakeup();
 
+                    // 处理拦截器回调
                     if (this.interceptors == null)
                         return new ConsumerRecords<>(records);
                     else
@@ -1063,7 +1070,7 @@ public class KafkaConsumer<K, V> implements Consumer<K, V> {
 
             return ConsumerRecords.empty();
         } finally {
-            release();
+            release(); // 释放锁
         }
     }
 
@@ -1088,7 +1095,7 @@ public class KafkaConsumer<K, V> implements Consumer<K, V> {
             return records;
 
         // send any new fetches (won't resend pending fetches)
-        fetcher.sendFetches();
+        fetcher.sendFetches(); // pollOnce()
 
         long now = time.milliseconds();
         long pollTimeout = Math.min(coordinator.timeToNextPoll(now), timeout);
@@ -1264,7 +1271,7 @@ public class KafkaConsumer<K, V> implements Consumer<K, V> {
             Collection<TopicPartition> parts = partitions.size() == 0 ? this.subscriptions.assignedPartitions() : partitions;
             for (TopicPartition tp : parts) {
                 log.debug("Seeking to beginning of partition {}", tp);
-                subscriptions.needOffsetReset(tp, OffsetResetStrategy.EARLIEST);
+                subscriptions.needOffsetReset(tp, OffsetResetStrategy.EARLIEST); // seekToBeginning
             }
         } finally {
             release();
@@ -1285,7 +1292,7 @@ public class KafkaConsumer<K, V> implements Consumer<K, V> {
             Collection<TopicPartition> parts = partitions.size() == 0 ? this.subscriptions.assignedPartitions() : partitions;
             for (TopicPartition tp : parts) {
                 log.debug("Seeking to end of partition {}", tp);
-                subscriptions.needOffsetReset(tp, OffsetResetStrategy.LATEST);
+                subscriptions.needOffsetReset(tp, OffsetResetStrategy.LATEST); // seekToEnd
             }
         } finally {
             release();
@@ -1644,9 +1651,13 @@ public class KafkaConsumer<K, V> implements Consumer<K, V> {
             // if we still don't have offsets for the given partitions, then we should either
             // seek to the last committed position or reset using the auto reset policy
 
+            // 恢复已提交的offset进度
+            // 底层通过 OffsetFetchRequest 请求broker
             // first refresh commits for all assigned partitions
             coordinator.refreshCommittedOffsetsIfNeeded();
 
+            // 若仍有offset未知, 则使用默认的reset策略(Earliest OR Latest)从broker获取初始offset
+            // 底层通过 ListOffsetRequest 请求broker
             // then do any offset lookups in case some positions are not known
             fetcher.updateFetchPositions(partitions);
         }

@@ -260,6 +260,7 @@ class RequestChannel(val numProcessors: Int, val queueSize: Int) extends KafkaMe
   /** Send a response back to the socket server to be sent over the network */
   def sendResponse(response: RequestChannel.Response) {
     responseQueues(response.processor).put(response)
+    // 回调responseListener, socketServer默认添加一个唤醒对应processor的实现
     for(onResponse <- responseListeners)
       onResponse(response.processor)
   }

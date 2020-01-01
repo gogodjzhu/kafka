@@ -113,7 +113,7 @@ public final class WorkerCoordinator extends AbstractCoordinator implements Clos
             }
 
             if (needRejoin()) {
-                ensureActiveGroup();
+                ensureActiveGroup(); // WorkerCoordinator#poll()
                 now = time.milliseconds();
             }
 

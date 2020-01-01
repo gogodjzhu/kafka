@@ -64,12 +64,18 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * This class manages the coordination process with the consumer coordinator.
+ * 本类负责管理consumer的协同状态,包括:
+ * 1. 跟broker之间维持心跳
+ * 2. 维护本consumer的TP订阅信息
+ * 3. 维护本consumer所订阅TP对应的集群信息在本地的缓存
+ * 3. 利用集群信息, 处理消费请求的发起
  */
 public final class ConsumerCoordinator extends AbstractCoordinator {
 
     private static final Logger log = LoggerFactory.getLogger(ConsumerCoordinator.class);
 
     private final List<PartitionAssignor> assignors;
+    // 元数据
     private final Metadata metadata;
     private final ConsumerCoordinatorMetrics sensors;
     private final SubscriptionState subscriptions;
@@ -294,7 +300,7 @@ public final class ConsumerCoordinator extends AbstractCoordinator {
                 if (subscriptions.hasPatternSubscription())
                     client.ensureFreshMetadata();
 
-                ensureActiveGroup();
+                ensureActiveGroup(); // ConsumerCoordinator#poll()
                 now = time.milliseconds();
             }
         } else {

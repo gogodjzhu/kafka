@@ -199,10 +199,11 @@ public class Sender implements Runnable {
      * @param now The current POSIX time in milliseconds
      */
     void run(long now) {
-        // 带事务管理的发送
         if (transactionManager != null) {
+            /** 带事务管理的Producer, 需要先做确保事务请求{@link TransactionManager#pendingRequests}优先处理 **/
             if (!transactionManager.isTransactional()) {
                 // this is an idempotent producer, so make sure we have a producer id
+                // transactionManager实例存在 但 没有配置transactional.id 标识这是一个幂等producer, 需要保证它存在producerId
                 maybeWaitForProducerId();
             } else if (transactionManager.hasInFlightRequest() || maybeSendTransactionalRequest(now)) {
                 // as long as there are outstanding transactional requests, we simply wait for them to return
@@ -223,6 +224,7 @@ public class Sender implements Runnable {
             }
         }
 
+        /** 常规的ProducerData消息 */
         // sendProducerData方法从accumulator队列中获取新的可发送数据，封装为Send对象，添加到发送目标的kafkaChannel缓存
         long pollTimeout = sendProducerData(now);
         // poll方法底层调用nioSelector方法的poll方法，捕捉到可发送事件时把Send对象包含的消息发送出去
@@ -315,6 +317,7 @@ public class Sender implements Runnable {
     }
 
     private boolean maybeSendTransactionalRequest(long now) {
+        // NOTE batch未完成
         if (transactionManager.isCompleting() && accumulator.hasIncomplete()) {
             if (transactionManager.isAborting())
                 accumulator.abortUndrainedBatches(new KafkaException("Failing batch since transaction was aborted"));
@@ -332,34 +335,46 @@ public class Sender implements Runnable {
             return false;
 
         AbstractRequest.Builder<?> requestBuilder = nextRequestHandler.requestBuilder();
+        /*循环体内正常return的请求表示处理结束，否则break while循环之后会重试*/
         while (true) {
             Node targetNode = null;
             try {
                 if (nextRequestHandler.needsCoordinator()) {
+                    // 请求需要由Coordinator处理，所以尝试获取它的信息
                     targetNode = transactionManager.coordinator(nextRequestHandler.coordinatorType());
                     if (targetNode == null) {
+                        // coordinator不存在，构造并异步发送获取coordinator的请求
+                        // 在本方法中，先将寻找coordinator的FindCoordinatorRequest请求添加到txnManager的消息队列中，而当前请求
+                        // 会在退出循环后才通过retry重新加入队列. 因此寻找Coordinator的消息会优先被执行
                         transactionManager.lookupCoordinator(nextRequestHandler);
                         break;
                     }
 
                     if (!NetworkClientUtils.awaitReady(client, targetNode, time, requestTimeout)) {
+                        // coordinator无法链接，重新寻找coordinator
                         transactionManager.lookupCoordinator(nextRequestHandler);
                         break;
                     }
                 } else {
+                    // 不需要coordinator作为请求的处理节点，那么选择一个最空闲的即可
                     targetNode = awaitLeastLoadedNodeReady(requestTimeout);
                 }
 
                 if (targetNode != null) {
                     if (nextRequestHandler.isRetry())
+                        // 这是重试请求，执行前休眠控制qps
                         time.sleep(nextRequestHandler.retryBackoffMs());
 
+                    // 将事务请求封装成一个普通的客户端请求发送出去
                     ClientRequest clientRequest = client.newClientRequest(targetNode.idString(),
                             requestBuilder, now, true, nextRequestHandler);
+                    // 将本消息的correlationId 设置到inFlight, 这是一个值而不是队列, 意味着在TransactionManager内部同时只能发
+                    // 送一个消息
                     transactionManager.setInFlightRequestCorrelationId(clientRequest.correlationId());
                     log.debug("{}Sending transactional request {} to node {}",
                             transactionManager.logPrefix, requestBuilder, targetNode);
 
+                    // 异步发送消息, 准确的发送时机等待Sender调度
                     client.send(clientRequest, now);
                     return true;
                 }
@@ -377,6 +392,7 @@ public class Sender implements Runnable {
             metadata.requestUpdate();
         }
 
+        // 重试请求
         transactionManager.retry(nextRequestHandler);
         return true;
     }

@@ -27,6 +27,9 @@ import kafka.server.checkpoints.{LeaderEpochCheckpointFile, LeaderEpochFile}
 import kafka.server.epoch.{LeaderEpochCache, LeaderEpochFileCache}
 import org.apache.kafka.common.utils.Time
 
+/**
+  * 数据副本类, Leader和Follower都是此类实现
+  */
 class Replica(val brokerId: Int,
               val topicPartition: TopicPartition,
               time: Time = Time.SYSTEM,
@@ -34,16 +37,19 @@ class Replica(val brokerId: Int,
               val log: Option[Log] = None) extends Logging {
   // the high watermark offset value, in non-leader replicas only its message offsets are kept
   @volatile private[this] var highWatermarkMetadata = new LogOffsetMetadata(initialHighWatermarkValue)
+
+  /** 当前replica保存的end/start offset, 对于follower这个值仅代表自身保存的值且只通过follower FetchRequest 请求更新 */
   // the log end offset value, kept in all replicas;
   // for local replica it is the log's end offset, for remote replicas its value is only updated by follower fetch
-  @volatile private[this] var logEndOffsetMetadata = LogOffsetMetadata.UnknownOffsetMetadata
+  @volatile private[this] var logEndOffsetMetadata = LogOffsetMetadata.UnknownOffsetMetadata // TODO WHAT?
   // the log start offset value, kept in all replicas;
   // for local replica it is the log's start offset, for remote replicas its value is only updated by follower fetch
-  @volatile private[this] var _logStartOffset = Log.UnknownLogStartOffset
+  @volatile private[this] var _logStartOffset = Log.UnknownLogStartOffset // TODO WHAT
 
+  /** leader节点上一次接受Follower的FetchRequest请求时的end offset */
   // The log end offset value at the time the leader received the last FetchRequest from this follower
   // This is used to determine the lastCaughtUpTimeMs of the follower
-  @volatile private[this] var lastFetchLeaderLogEndOffset = 0L
+  @volatile private[this] var lastFetchLeaderLogEndOffset = 0L // TODO WHAT
 
   // The time when the leader received the last FetchRequest from this follower
   // This is used to determine the lastCaughtUpTimeMs of the follower
@@ -51,6 +57,7 @@ class Replica(val brokerId: Int,
 
   // lastCaughtUpTimeMs is the largest time t such that the offset of most recent FetchRequest from this follower >=
   // the LEO of leader at time t. This is used to determine the lag of this follower and ISR of this partition.
+  // 最近一次此Follower Replica追上Leader的时间, 用于判断此Follower的延时状态, 并用来调整ISR列表
   @volatile private[this] var _lastCaughtUpTimeMs = 0L
 
   def isLocal: Boolean = log.isDefined
@@ -73,17 +80,22 @@ class Replica(val brokerId: Int,
    * by at most `replicaLagTimeMaxMs`. These semantics allow a follower to be added to the ISR even if the offset of its
    * fetch request is always smaller than the leader's LEO, which can happen if small produce requests are received at
    * high frequency.
+   *
+   * 根据消费Log的结果更新Replica的消费进度, 包括:
+   * - lastCaughtUpTimeMs 上一次追上leader的时间
    */
   def updateLogReadResult(logReadResult : LogReadResult) {
     if (logReadResult.info.fetchOffsetMetadata.messageOffset >= logReadResult.leaderLogEndOffset)
+      // 本次消费追上了leader LEO(LogEndOffset), 那么将_lastCaughtUpTimeMs 置为本次消费的时间fetchTimeMs
       _lastCaughtUpTimeMs = math.max(_lastCaughtUpTimeMs, logReadResult.fetchTimeMs)
     else if (logReadResult.info.fetchOffsetMetadata.messageOffset >= lastFetchLeaderLogEndOffset)
+      // 本次消费追上了上一次消费时的leader LEO, 将_lastCaughtUpTimeMs 置为上一次消费的时间 TODO Why?
       _lastCaughtUpTimeMs = math.max(_lastCaughtUpTimeMs, lastFetchTimeMs)
 
     logStartOffset = logReadResult.followerLogStartOffset
     logEndOffset = logReadResult.info.fetchOffsetMetadata
-    lastFetchLeaderLogEndOffset = logReadResult.leaderLogEndOffset
-    lastFetchTimeMs = logReadResult.fetchTimeMs
+    lastFetchLeaderLogEndOffset = logReadResult.leaderLogEndOffset // 更新leader LEO
+    lastFetchTimeMs = logReadResult.fetchTimeMs // 更新拉取时间
   }
 
   def resetLastCaughtUpTime(curLeaderLogEndOffset: Long, curTimeMs: Long, lastCaughtUpTimeMs: Long) {
@@ -156,6 +168,8 @@ class Replica(val brokerId: Int,
    * the corresponding COMMIT or ABORT marker is written. This implies that the last stable offset will be equal
    * to the high watermark if there are no transactional messages in the log. Note also that the LSO cannot advance
    * beyond the high watermark.
+   *
+   * LastStableOffset(LSO), 代表已经事务提交(COMMIT/ABORT)的最大offset, 若非事务写入的数据则无事务提交限制(此时跟HW等效)
    */
   def lastStableOffset: LogOffsetMetadata = {
     log.map { log =>
