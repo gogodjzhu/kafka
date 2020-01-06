@@ -376,6 +376,11 @@ object ProducerStateManager {
  * age. This ensures that producer ids will not be expired until either the max expiration time has been reached,
  * or if the topic also is configured for deletion, the segment containing the last written offset has
  * been deleted.
+ *
+ * 用于维护producerIds到消费者元数(如epoch, sequence number, last offset)的映射
+ *
+ * sequence number是幂等producer用来标识唯一消息的标记; epoch是一个producer的任期标识, 用于防止假死producer发送脏数据
+ *
  */
 @nonthreadsafe
 class ProducerStateManager(val topicPartition: TopicPartition,
@@ -494,6 +499,7 @@ class ProducerStateManager(val topicPartition: TopicPartition,
   def truncateAndReload(logStartOffset: Long, logEndOffset: Long, currentTimeMs: Long) {
     // remove all out of range snapshots
     deleteSnapshotFiles { snapOffset =>
+      // snapshot越界, 此snapshot无效
       snapOffset > logEndOffset || snapOffset <= logStartOffset
     }
 

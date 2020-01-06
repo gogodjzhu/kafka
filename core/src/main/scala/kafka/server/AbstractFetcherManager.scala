@@ -27,6 +27,9 @@ import com.yammer.metrics.core.Gauge
 import org.apache.kafka.common.TopicPartition
 import org.apache.kafka.common.utils.Utils
 
+/**
+ * AbsFetcherManager, 负责管理Replica/Consumer定时向partitionLeader拉取消息的线程
+ */
 abstract class AbstractFetcherManager(protected val name: String, clientId: String, numFetchers: Int = 1)
   extends Logging with KafkaMetricsGroup {
   // map of (source broker_id, fetcher_id per source broker) => fetcher
@@ -71,6 +74,9 @@ abstract class AbstractFetcherManager(protected val name: String, clientId: Stri
   // to be defined in subclass to create a specific fetcher
   def createFetcherThread(fetcherId: Int, sourceBroker: BrokerEndPoint): AbstractFetcherThread
 
+  /**
+   * 添加并启动一个指向目标Partition的Fetcher线程, 具体启动的是什么Fetcher线程实例, 依赖子类的createFetcherThread方法
+   */
   def addFetcherForPartitions(partitionAndOffsets: Map[TopicPartition, BrokerAndInitialOffset]) {
     mapLock synchronized {
       val partitionsPerFetcher = partitionAndOffsets.groupBy { case(topicPartition, brokerAndInitialOffset) =>
@@ -94,6 +100,7 @@ abstract class AbstractFetcherManager(protected val name: String, clientId: Stri
             addAndStartFetcherThread(brokerAndFetcherId, brokerIdAndFetcherId)
         }
 
+        // 往FetchThread中添加需要拉取的Partition信息PartitionFetchState
         fetcherThreadMap(brokerIdAndFetcherId).addPartitions(partitionAndOffsets.map { case (tp, brokerAndInitOffset) =>
           tp -> brokerAndInitOffset.initOffset
         })

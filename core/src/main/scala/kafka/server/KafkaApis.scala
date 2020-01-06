@@ -98,7 +98,7 @@ class KafkaApis(val requestChannel: RequestChannel,
         case ApiKeys.FETCH => handleFetchRequest(request)
         case ApiKeys.LIST_OFFSETS => handleListOffsetRequest(request)
         case ApiKeys.METADATA => handleTopicMetadataRequest(request)
-        case ApiKeys.LEADER_AND_ISR => handleLeaderAndIsrRequest(request)
+        case ApiKeys.LEADER_AND_ISR => handleLeaderAndIsrRequest(request) // TODO-NOTE handleLeaderAndIsrRequest 跟 handleUpdateMetadataRequest的差别?
         case ApiKeys.STOP_REPLICA => handleStopReplicaRequest(request)
         case ApiKeys.UPDATE_METADATA_KEY => handleUpdateMetadataRequest(request)
         case ApiKeys.CONTROLLED_SHUTDOWN_KEY => handleControlledShutdownRequest(request)
@@ -137,6 +137,10 @@ class KafkaApis(val requestChannel: RequestChannel,
     }
   }
 
+  /**
+   * 非controller Broker接收controller发送的leader和ISR列表信息更新请求
+   * @param request
+   */
   def handleLeaderAndIsrRequest(request: RequestChannel.Request) {
     // ensureTopicExists is only for client facing requests
     // We can't have the ensureTopicExists check here since the controller sends it as an advisory to all brokers so they
@@ -145,30 +149,31 @@ class KafkaApis(val requestChannel: RequestChannel,
     val leaderAndIsrRequest = request.body[LeaderAndIsrRequest]
 
     try {
+      // 当前broker的PartitionLeader状态变化后回调此方法
       def onLeadershipChange(updatedLeaders: Iterable[Partition], updatedFollowers: Iterable[Partition]) {
         // for each new leader or follower, call coordinator to handle consumer group migration.
         // this callback is invoked under the replica state change lock to ensure proper order of
         // leadership changes
         updatedLeaders.foreach { partition =>
-          if (partition.topic == GROUP_METADATA_TOPIC_NAME)
+          if (partition.topic == GROUP_METADATA_TOPIC_NAME) // 当前broker成为__consumer_group topic的一个PartitionLeader
             groupCoordinator.handleGroupImmigration(partition.partitionId)
-          else if (partition.topic == TRANSACTION_STATE_TOPIC_NAME)
+          else if (partition.topic == TRANSACTION_STATE_TOPIC_NAME) // 当前broker成为__transaction_state topic的一个PartitionLeader
             txnCoordinator.handleTxnImmigration(partition.partitionId, partition.getLeaderEpoch)
         }
 
         updatedFollowers.foreach { partition =>
-          if (partition.topic == GROUP_METADATA_TOPIC_NAME)
+          if (partition.topic == GROUP_METADATA_TOPIC_NAME) // 当前broker失去__consumer_group topic的一个PartitionLeader角色
             groupCoordinator.handleGroupEmigration(partition.partitionId)
-          else if (partition.topic == TRANSACTION_STATE_TOPIC_NAME)
+          else if (partition.topic == TRANSACTION_STATE_TOPIC_NAME) // 当前broker失去__transaction_state topic的一个PartitionLeader角色
             txnCoordinator.handleTxnEmigration(partition.partitionId, partition.getLeaderEpoch)
         }
       }
 
-      if (authorize(request.session, ClusterAction, Resource.ClusterResource)) {
+      if (authorize(request.session, ClusterAction, Resource.ClusterResource)) { // 鉴权成功, 处理
         val result = replicaManager.becomeLeaderOrFollower(correlationId, leaderAndIsrRequest, onLeadershipChange)
         val leaderAndIsrResponse = new LeaderAndIsrResponse(result.error, result.responseMap.asJava)
         sendResponseExemptThrottle(RequestChannel.Response(request, leaderAndIsrResponse))
-      } else {
+      } else { // 鉴权失败, 发送失败响应
         val result = leaderAndIsrRequest.partitionStates.asScala.keys.map((_, Errors.CLUSTER_AUTHORIZATION_FAILED)).toMap
         sendResponseMaybeThrottle(request, _ =>
           new LeaderAndIsrResponse(Errors.CLUSTER_AUTHORIZATION_FAILED, result.asJava))
@@ -473,7 +478,7 @@ class KafkaApis(val requestChannel: RequestChannel,
 
       // if the request is put into the purgatory, it will have a held reference and hence cannot be garbage collected;
       // hence we clear its data here inorder to let GC re-claim its memory since it is already appended to log
-      produceRequest.clearPartitionRecords()
+      produceRequest.clearPartitionRecords() // 清除record的引用, 便于gc
     }
   }
 

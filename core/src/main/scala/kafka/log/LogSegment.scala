@@ -98,7 +98,7 @@ class LogSegment(val log: FileRecords,
    * an entry to the index if needed.
    *
    * It is assumed this method is being called from within a lock.
-   *
+   * 将record写入segment, 必要的时候插入索引
    * @param firstOffset The first offset in the message set.
    * @param largestOffset The last offset in the message set
    * @param largestTimestamp The largest timestamp in the message set.

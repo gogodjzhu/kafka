@@ -57,7 +57,7 @@ class ReplicaFetcherThread(name: String,
 
   type REQ = FetchRequest
   type PD = PartitionData
-
+  // Replica同步的leader
   private val leaderEndpoint = leaderEndpointBlockingSend.getOrElse(
     new ReplicaFetcherBlockingSend(sourceBroker, brokerConfig, metrics, time, fetcherId, s"broker-${brokerConfig.brokerId}-fetcher-$fetcherId"))
   private val fetchRequestVersion: Short =
@@ -82,6 +82,7 @@ class ReplicaFetcherThread(name: String,
   }
 
   // process fetched data
+  // 处理replica从leader拉取的消息
   def processPartitionData(topicPartition: TopicPartition, fetchOffset: Long, partitionData: PartitionData) {
     try {
       val replica = replicaMgr.getReplica(topicPartition).get
@@ -96,16 +97,20 @@ class ReplicaFetcherThread(name: String,
           .format(replica.brokerId, replica.logEndOffset.messageOffset, topicPartition, records.sizeInBytes, partitionData.highWatermark))
 
       // Append the leader's messages to the log
+      // 消息写入follower log
       replica.log.get.appendAsFollower(records)
 
       if (logger.isTraceEnabled)
         trace("Follower %d has replica log end offset %d after appending %d bytes of messages for partition %s"
           .format(replica.brokerId, replica.logEndOffset.messageOffset, records.sizeInBytes, topicPartition))
+      // 在任意replia内(leader or follower), 必须满足 HW<= LEO
       val followerHighWatermark = replica.logEndOffset.messageOffset.min(partitionData.highWatermark)
       val leaderLogStartOffset = partitionData.logStartOffset
       // for the follower replica, we do not need to keep
       // its segment base offset the physical position,
       // these values will be computed upon making the leader
+      // 由于本方法是follower replica拉取leader调用的, follower不直接处理读请求, 所以它的HW不保存offsetMetadata的位移信息
+      // 当此replica成为leader的时候可以通过日志恢复HW
       replica.highWatermark = new LogOffsetMetadata(followerHighWatermark)
       replica.maybeIncrementLogStartOffset(leaderLogStartOffset)
       if (logger.isTraceEnabled)
@@ -253,12 +258,18 @@ class ReplicaFetcherThread(name: String,
     * - If the leader's offset is greater, we stick with the Log End Offset
     *   otherwise we truncate to the leaders offset.
     * - If the leader replied with undefined epoch offset we must use the high watermark
+    *
+    * 根据leader返回的在Leader缓存的partition信息, 选择更新log, 存在以下几种情况:
+    * 1. leader的offset大于当前replica, 不需要处理, 等待稍后追上leader即可
+    * 2. leader的offset小于当前replica, 清空offset大于leader LEO的消息
+    * 3. 根据epoch需要响应处理
     */
   override def maybeTruncate(fetchedEpochs: Map[TopicPartition, EpochEndOffset]): Map[TopicPartition, Long] = {
     val truncationPoints = scala.collection.mutable.HashMap.empty[TopicPartition, Long]
     val partitionsWithError = mutable.Set[TopicPartition]()
 
     fetchedEpochs.foreach { case (tp, epochOffset) =>
+      // 找到replica对象
       val replica = replicaMgr.getReplica(tp).get
 
       if (epochOffset.hasError) {
@@ -266,16 +277,17 @@ class ReplicaFetcherThread(name: String,
         partitionsWithError += tp
       } else {
         val truncationOffset =
-          if (epochOffset.endOffset() == UNDEFINED_EPOCH_OFFSET)
+          if (epochOffset.endOffset() == UNDEFINED_EPOCH_OFFSET) // leader缺少TP的offset信息, follower回滚到HW // TODO-NOTE 如何恢复？ leader如何会选择没有offset信息的节点?
             highWatermark(replica, epochOffset)
-          else if (epochOffset.endOffset() >= replica.logEndOffset.messageOffset)
+          else if (epochOffset.endOffset() >= replica.logEndOffset.messageOffset) // leader的LEO大于等于本地LEO, 继续使用本地LEO作为truncationOffset(即不回滚)
             logEndOffset(replica, epochOffset)
           else
-            epochOffset.endOffset
+            epochOffset.endOffset // leader的LEO小于本地, 为了数据一致，回滚本地消息到leader LEO
 
         truncationPoints.put(tp, truncationOffset)
       }
     }
+    // 批量回滚所有需要会回滚的TopicPartition log
     replicaMgr.logManager.truncateTo(truncationPoints)
 
     // For partitions that encountered an error, delay them a bit before retrying the leader epoch request
@@ -284,9 +296,14 @@ class ReplicaFetcherThread(name: String,
     truncationPoints
   }
 
+  /**
+   * 根据PartitionFetchState.isTruncatingLog=true过滤
+   * @param allPartitions
+   * @return
+   */
   override def buildLeaderEpochRequest(allPartitions: Seq[(TopicPartition, PartitionFetchState)]): Map[TopicPartition, Int] = {
     val result = allPartitions
-      .filter { case (_, state) => state.isTruncatingLog }
+      .filter { case (_, state) => state.isTruncatingLog } // 这里是关键! 根据isTruncatingLog过滤
       .map { case (tp, _) => tp -> epochCache(tp).latestEpoch }.toMap
 
     debug(s"Build leaderEpoch request $result for broker $sourceBroker")
@@ -294,6 +311,7 @@ class ReplicaFetcherThread(name: String,
     result
   }
 
+  // 构造指向partitionLeader的OffsetsForLeaderEpochRequest请求, 同步发送之
   override def fetchEpochsFromLeader(partitions: Map[TopicPartition, Int]): Map[TopicPartition, EpochEndOffset] = {
     var result: Map[TopicPartition, EpochEndOffset] = null
     if (shouldSendLeaderEpochRequest) {

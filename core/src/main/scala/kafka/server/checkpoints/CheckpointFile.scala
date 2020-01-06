@@ -79,17 +79,17 @@ class CheckpointFile[T](val file: File, version: Int, formatter: CheckpointFileF
       val reader = new BufferedReader(new InputStreamReader(new FileInputStream(file), StandardCharsets.UTF_8))
       var line: String = null
       try {
-        line = reader.readLine()
+        line = reader.readLine() // 第一行: version
         if (line == null)
           return Seq.empty
         line.toInt match {
           case fileVersion if fileVersion == version =>
-            line = reader.readLine()
+            line = reader.readLine() // 第二行
             if (line == null)
               return Seq.empty
             val expectedSize = line.toInt
             val entries = mutable.Buffer[T]()
-            line = reader.readLine()
+            line = reader.readLine() // 遍历剩余行
             while (line != null) {
               val entry = formatter.fromLine(line)
               entry match {

@@ -24,7 +24,7 @@ import java.util.concurrent.locks.Lock
 import com.yammer.metrics.core.Gauge
 import kafka.api._
 import kafka.cluster.{Partition, Replica}
-import kafka.common.KafkaStorageException
+import kafka.common.{KafkaStorageException, TopicAndPartition}
 import kafka.controller.KafkaController
 import kafka.log.{Log, LogAppendInfo, LogManager}
 import kafka.metrics.KafkaMetricsGroup
@@ -246,6 +246,10 @@ class ReplicaManager(val config: KafkaConfig,
    *
    * 1. The partition HW has changed (for acks = -1)
    * 2. A follower replica's fetch operation is received (for acks > 1)
+   *
+   * 尝试完成一个DelayProduceRequest(通过key关联的), 本方法可能在两个地方被触发:
+   * 1. 当acks=-1时, HW变更后会触发本方法
+   * 2. 当acks>1时, 任意Follower Replica的Fetch请求到来后会触发
    */
   def tryCompleteDelayedProduce(key: DelayedOperationKey) {
     val completed = delayedProducePurgatory.checkAndComplete(key)
@@ -388,8 +392,10 @@ class ReplicaManager(val config: KafkaConfig,
                   new PartitionResponse(result.error, result.info.firstOffset, result.info.logAppendTime)) // response status
       }
 
+      // 判断是否需要进入delayProducer流程(等待follower ack)
       if (delayedProduceRequestRequired(requiredAcks, entriesPerPartition, localProduceResults)) {
         // create delayed produce operation
+        // 创建延迟操作对象
         val produceMetadata = ProduceMetadata(requiredAcks, produceStatus)
         val delayedProduce = new DelayedProduce(timeout, produceMetadata, this, responseCallback, delayedProduceLock)
 
@@ -399,6 +405,7 @@ class ReplicaManager(val config: KafkaConfig,
         // try to complete the request immediately, otherwise put it into the purgatory
         // this is because while the delayed produce operation is being created, new
         // requests may arrive and hence make this operation completable.
+        // 将延迟操作对象注册到Purgatory监听, 当follower ack完成后通过Purgatory.checkAndComplete()方法完成延迟操作(回调responseCallback)
         delayedProducePurgatory.tryCompleteElseWatch(delayedProduce, producerRequestKeys)
 
       } else {
@@ -855,18 +862,22 @@ class ReplicaManager(val config: KafkaConfig,
     replicaStateChangeLock synchronized {
       val responseMap = new mutable.HashMap[TopicPartition, Errors]
       if (leaderAndISRRequest.controllerEpoch < controllerEpoch) {
+        // controller任期小于当前缓存的任期, 可能来自僵尸controller
         stateChangeLogger.warn(("Broker %d ignoring LeaderAndIsr request from controller %d with correlation id %d since " +
           "its controller epoch %d is old. Latest known controller epoch is %d").format(localBrokerId, leaderAndISRRequest.controllerId,
           correlationId, leaderAndISRRequest.controllerEpoch, controllerEpoch))
-        BecomeLeaderOrFollowerResult(responseMap, Errors.STALE_CONTROLLER_EPOCH)
+        BecomeLeaderOrFollowerResult(responseMap, Errors.STALE_CONTROLLER_EPOCH) // 返回stale信息, controller应该放弃自己的controller角色
       } else {
+        // 更新controller信息
         val controllerId = leaderAndISRRequest.controllerId
         controllerEpoch = leaderAndISRRequest.controllerEpoch
 
         // First check partition's leader epoch
         val partitionState = new mutable.HashMap[Partition, PartitionState]()
         leaderAndISRRequest.partitionStates.asScala.foreach { case (topicPartition, stateInfo) =>
-          val partition = getOrCreatePartition(topicPartition)
+          // 请求内包含partition的信息, 如果判断controller.epoch > partitionLeader.epoch, 我们认为来自controller的信息是合法的,
+          // 那么会使用这些信息来更新本地partition的信息缓存
+          val partition = getOrCreatePartition(topicPartition) // 在当前replica实例的TopicPartition缓存中创建新的(或获取已有)
           val partitionLeaderEpoch = partition.getLeaderEpoch
           // If the leader epoch is valid record the epoch of the controller that made the leadership decision.
           // This is useful while updating the isr to maintain the decision maker controller's epoch in the zookeeper path
@@ -890,16 +901,20 @@ class ReplicaManager(val config: KafkaConfig,
           }
         }
 
+        // 在最新的partition信息列表中寻找leader为当前broker的(become leader)
         val partitionsTobeLeader = partitionState.filter { case (_, stateInfo) =>
           stateInfo.leader == localBrokerId
         }
+        // 除了leader为当前broker的其余partition, 本broker自然充当follower角色(become follower)
         val partitionsToBeFollower = partitionState -- partitionsTobeLeader.keys
 
         val partitionsBecomeLeader = if (partitionsTobeLeader.nonEmpty)
+          // become leader
           makeLeaders(controllerId, controllerEpoch, partitionsTobeLeader, correlationId, responseMap)
         else
           Set.empty[Partition]
         val partitionsBecomeFollower = if (partitionsToBeFollower.nonEmpty)
+          // become follower
           makeFollowers(controllerId, controllerEpoch, partitionsToBeFollower, correlationId, responseMap)
         else
           Set.empty[Partition]
@@ -929,6 +944,11 @@ class ReplicaManager(val config: KafkaConfig,
    * the error message will be set on each partition since we do not know which partition caused it. Otherwise,
    * return the set of partitions that are made leader due to this method
    *
+   * 将当前broker升级为指定partition(s)的leader,会处理以下事务:
+   * 1. 停止作为follower的Fetcher线程
+   * 2. 更新partition信息
+   * 3. 将对应的partition添加到leaderPartition集合
+   *
    *  TODO: the above may need to be fixed later
    */
   private def makeLeaders(controllerId: Int,
@@ -936,6 +956,7 @@ class ReplicaManager(val config: KafkaConfig,
                           partitionState: Map[Partition, PartitionState],
                           correlationId: Int,
                           responseMap: mutable.Map[TopicPartition, Errors]): Set[Partition] = {
+    // 打日志
     partitionState.keys.foreach { partition =>
       stateChangeLogger.trace(("Broker %d handling LeaderAndIsr request correlationId %d from controller %d epoch %d " +
         "starting the become-leader transition for partition %s")
@@ -952,13 +973,14 @@ class ReplicaManager(val config: KafkaConfig,
       replicaFetcherManager.removeFetcherForPartitions(partitionState.keySet.map(_.topicPartition))
       // Update the partition information to be the leader
       partitionState.foreach{ case (partition, partitionStateInfo) =>
-        if (partition.makeLeader(controllerId, partitionStateInfo, correlationId))
-          partitionsToMakeLeaders += partition
+        if (partition.makeLeader(controllerId, partitionStateInfo, correlationId)) // 将当前broker切换为partitionLeader, 成功返回true
+          partitionsToMakeLeaders += partition // 记下所有的新晋partitionLeader, 方便后续打日志
         else
           stateChangeLogger.info(("Broker %d skipped the become-leader state change after marking its partition as leader with correlation id %d from " +
             "controller %d epoch %d for partition %s since it is already the leader for the partition.")
             .format(localBrokerId, correlationId, controllerId, epoch, partition.topicPartition))
       }
+      // 打日志
       partitionsToMakeLeaders.foreach { partition =>
         stateChangeLogger.trace(("Broker %d stopped fetchers as part of become-leader request from controller " +
           "%d epoch %d with correlation id %d for partition %s")
@@ -1001,6 +1023,15 @@ class ReplicaManager(val config: KafkaConfig,
    * If an unexpected error is thrown in this function, it will be propagated to KafkaApis where
    * the error message will be set on each partition since we do not know which partition caused it. Otherwise,
    * return the set of partitions that are made follower due to this method
+   *
+   * 使当前broker成为指定partition的follower replica, 执行以下步骤:
+   * 1. 将指定partition从当前broker的leaderPartition set移除
+   * 2. 将当前replica置为指定partition的follower
+   * 3. 从replicaFetcherManager中停止已有的, 指向目标Partition的FetcherThread. 因为这部分Thread的信息需要更新
+   * 4. 移除日志和checkpoint offset(这一步实际上已迁移到ReplicaFetcherThread中执行)
+   * 5. 从purgatory完成剩下的produce和fetch请求
+   * 6. 重新构造指向新的partitionLeader的FetcherThread加入replicaFetcherManager, replica开始向新的leader同步消息
+   *
    */
   private def makeFollowers(controllerId: Int,
                             epoch: Int,
@@ -1022,7 +1053,9 @@ class ReplicaManager(val config: KafkaConfig,
 
       // TODO: Delete leaders from LeaderAndIsrRequest
       partitionState.foreach{ case (partition, partitionStateInfo) =>
+        // 修改后partition的leader节点
         val newLeaderBrokerId = partitionStateInfo.leader
+        // 遍历本地缓存的broker信息
         metadataCache.getAliveBrokers.find(_.id == newLeaderBrokerId) match {
           // Only change partition state when the leader is available
           case Some(_) =>
@@ -1036,6 +1069,7 @@ class ReplicaManager(val config: KafkaConfig,
           case None =>
             // The leader broker should always be present in the metadata cache.
             // If not, we should record the error message and abort the transition process for this partition
+            // 在当前broker的缓存中没有目标leader broker的信息, 所以不能执行这样的状态修改. 当前broker简单地打下错误日志, 不做其他操作.
             stateChangeLogger.error(("Broker %d received LeaderAndIsrRequest with correlation id %d from controller" +
               " %d epoch %d for partition %s but cannot become follower since the new leader %d is unavailable.")
               .format(localBrokerId, correlationId, controllerId, partitionStateInfo.controllerEpoch,
@@ -1046,8 +1080,10 @@ class ReplicaManager(val config: KafkaConfig,
         }
       }
 
+      // 从replicaFetcherManager中移除即已有的指向目标TP的FetcherThread, 因为旧操作的目标可能还是旧的Leader. 这里统一移除(如果有的话)
+      // 方法最后还会重新启动一个新的FetcherThread继续工作
       replicaFetcherManager.removeFetcherForPartitions(partitionsToMakeFollower.map(_.topicPartition))
-      partitionsToMakeFollower.foreach { partition =>
+      partitionsToMakeFollower.foreach { partition => // 留下日志
         stateChangeLogger.trace(("Broker %d stopped fetchers as part of become-follower request from controller " +
           "%d epoch %d with correlation id %d for partition %s")
           .format(localBrokerId, controllerId, epoch, correlationId, partition.topicPartition))
@@ -1059,6 +1095,9 @@ class ReplicaManager(val config: KafkaConfig,
         tryCompleteDelayedFetch(topicPartitionOperationKey)
       }
 
+      // NOTE 事实上这里已经没有直接做Truncate操作(相关代码在0baea2ac提交中删除), 因为这样做可能会导致数据不一致的问题.
+      // 而此后follower在AbstractFetcherThread线程工作中, 每次从leader拉取的消息中都会包含leader的epoch和对应的LEO, follower据此来truncate能保证不会数据丢失
+      // 具体原因参看KIP-101
       partitionsToMakeFollower.foreach { partition =>
         stateChangeLogger.trace(("Broker %d truncated logs and checkpointed recovery boundaries for partition %s as part of " +
           "become-follower request with correlation id %d from controller %d epoch %d").format(localBrokerId,
@@ -1074,6 +1113,7 @@ class ReplicaManager(val config: KafkaConfig,
       }
       else {
         // we do not need to check if the leader exists again since this has been done at the beginning of this process
+        // 重新构造FetcherThread加入replicaFetcherManager, 此时的Fetcher请求指向新的Leader节点, Offset则设置为本地log的LEO
         val partitionsToMakeFollowerWithLeaderAndOffset = partitionsToMakeFollower.map(partition =>
           partition.topicPartition -> BrokerAndInitialOffset(
             metadataCache.getAliveBrokers.find(_.id == partition.leaderReplicaIdOpt.get).get.getBrokerEndPoint(config.interBrokerListenerName),

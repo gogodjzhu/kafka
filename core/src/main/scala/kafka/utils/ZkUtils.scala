@@ -140,13 +140,16 @@ object ZkUtils {
     ZkUtils.BrokerTopicsPath + "/" + topic
   }
 
+  // /brokers/topics/<topic>/partitions
   def getTopicPartitionsPath(topic: String): String = {
     getTopicPath(topic) + "/partitions"
   }
 
+  // /brokers/topics/<topic>/partitions/<partitionId>
   def getTopicPartitionPath(topic: String, partitionId: Int): String =
     getTopicPartitionsPath(topic) + "/" + partitionId
 
+  // /brokers/topics/<topic>/partitions/<partitionId>/state
   def getTopicPartitionLeaderAndIsrPath(topic: String, partitionId: Int): String =
     getTopicPartitionPath(topic, partitionId) + "/" + "state"
 
@@ -721,6 +724,7 @@ class ZkUtils(val zkClient: ZkClient,
     val ret = new mutable.HashMap[TopicAndPartition, Seq[Int]]
     topics.foreach { topic =>
       val jsonPartitionMapOpt = readDataMaybeNull(getTopicPath(topic))._1
+      // {"version":1,"partitions":{"0":[0,1,2],"1":[0,1]}}
       jsonPartitionMapOpt match {
         case Some(jsonPartitionMap) =>
           Json.parseFull(jsonPartitionMap) match {

@@ -28,8 +28,8 @@ import kafka.server.epoch.{LeaderEpochCache, LeaderEpochFileCache}
 import org.apache.kafka.common.utils.Time
 
 /**
-  * 数据副本类, Leader和Follower都是此类实现
-  */
+ * 数据副本类, Leader和Follower都是此类实现
+ */
 class Replica(val brokerId: Int,
               val topicPartition: TopicPartition,
               time: Time = Time.SYSTEM,
@@ -41,15 +41,15 @@ class Replica(val brokerId: Int,
   /** 当前replica保存的end/start offset, 对于follower这个值仅代表自身保存的值且只通过follower FetchRequest 请求更新 */
   // the log end offset value, kept in all replicas;
   // for local replica it is the log's end offset, for remote replicas its value is only updated by follower fetch
-  @volatile private[this] var logEndOffsetMetadata = LogOffsetMetadata.UnknownOffsetMetadata // TODO WHAT?
+  @volatile private[this] var logEndOffsetMetadata = LogOffsetMetadata.UnknownOffsetMetadata
   // the log start offset value, kept in all replicas;
   // for local replica it is the log's start offset, for remote replicas its value is only updated by follower fetch
-  @volatile private[this] var _logStartOffset = Log.UnknownLogStartOffset // TODO WHAT
+  @volatile private[this] var _logStartOffset = Log.UnknownLogStartOffset
 
   /** leader节点上一次接受Follower的FetchRequest请求时的end offset */
   // The log end offset value at the time the leader received the last FetchRequest from this follower
   // This is used to determine the lastCaughtUpTimeMs of the follower
-  @volatile private[this] var lastFetchLeaderLogEndOffset = 0L // TODO WHAT
+  @volatile private[this] var lastFetchLeaderLogEndOffset = 0L
 
   // The time when the leader received the last FetchRequest from this follower
   // This is used to determine the lastCaughtUpTimeMs of the follower

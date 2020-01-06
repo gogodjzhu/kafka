@@ -61,9 +61,11 @@ class GroupMetadataManager(brokerId: Int,
   private val partitionLock = new ReentrantLock()
 
   /* partitions of consumer groups that are being loaded, its lock should be always called BEFORE the group lock if needed */
+  // 正在读入内存的, 当前Manager作为leader维护的consumer group的分区集合
   private val loadingPartitions: mutable.Set[Int] = mutable.Set()
 
   /* partitions of consumer groups that are assigned, using the same loading partition lock */
+  // 已读入内存的, 当前Manager作为leader维护的consumer group的分区集合
   private val ownedPartitions: mutable.Set[Int] = mutable.Set()
 
   /* shutting down flag */
@@ -435,11 +437,13 @@ class GroupMetadataManager(brokerId: Int,
 
   /**
    * Asynchronously read the partition from the offsets topic and populate the cache
+   * 异步读取__consumer_offsets指定partition的信息并更新消费者组的信息到本地缓存
    */
   def loadGroupsForPartition(offsetsPartition: Int, onGroupLoaded: GroupMetadata => Unit) {
+    // __consumer_offsets TopicPartition
     val topicPartition = new TopicPartition(Topic.GROUP_METADATA_TOPIC_NAME, offsetsPartition)
     info(s"Scheduling loading of offsets and group metadata from $topicPartition")
-    scheduler.schedule(topicPartition.toString, doLoadGroupsAndOffsets)
+    scheduler.schedule(topicPartition.toString, doLoadGroupsAndOffsets) // 在线程中执行实际操作
 
     def doLoadGroupsAndOffsets() {
       inLock(partitionLock) {
@@ -447,6 +451,7 @@ class GroupMetadataManager(brokerId: Int,
           info(s"Offset load from $topicPartition already in progress.")
           return
         } else {
+          // 加入loading集合, 防止数据竞争
           loadingPartitions.add(offsetsPartition)
         }
       }

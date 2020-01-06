@@ -243,6 +243,10 @@ class Log(@volatile var dir: File,
       new LeaderEpochCheckpointFile(LeaderEpochFile.newFile(dir)))
   }
 
+  /**
+   * 删除上次关机留下的临时文件
+   * @return
+   */
   private def removeTempFilesAndCollectSwapFiles(): Set[File] = {
     var swapFiles = Set[File]()
 
@@ -262,6 +266,7 @@ class Log(@volatile var dir: File,
           Files.deleteIfExists(file.toPath)
         } else if (isLogFile(baseFile)) {
           // delete the index files
+          // 删除了所有索引文件
           val offset = offsetFromFilename(baseFile.getName)
           Files.deleteIfExists(Log.offsetIndexFile(dir, offset).toPath)
           Files.deleteIfExists(Log.timeIndexFile(dir, offset).toPath)
@@ -276,9 +281,10 @@ class Log(@volatile var dir: File,
   private def loadSegmentFiles(): Unit = {
     // load segments in ascending order because transactional data from one segment may depend on the
     // segments that come before it
+    // 增序遍历所有segment文件, 因为segment是按照增序归档的, 某些事务操作依赖这个顺序
     for (file <- dir.listFiles.sortBy(_.getName) if file.isFile) {
       val filename = file.getName
-      if (isIndexFile(file)) {
+      if (isIndexFile(file)) { // 索引文件, 检查是否有对应的同名日志文件, 没有的话删除此索引
         // if it is an index file, make sure it has a corresponding .log file
         val offset = offsetFromFilename(filename)
         val logFile = Log.logFile(dir, offset)
@@ -286,7 +292,7 @@ class Log(@volatile var dir: File,
           warn("Found an orphaned index file, %s, with no corresponding log file.".format(file.getAbsolutePath))
           Files.deleteIfExists(file.toPath)
         }
-      } else if (isLogFile(file)) {
+      } else if (isLogFile(file)) { // 日志文件, 加载/恢复对应的索引文件
         // if it's a log file, load the corresponding log segment
         val startOffset = offsetFromFilename(filename)
         val indexFile = Log.offsetIndexFile(dir, startOffset)
@@ -295,15 +301,17 @@ class Log(@volatile var dir: File,
 
         val indexFileExists = indexFile.exists()
         val timeIndexFileExists = timeIndexFile.exists()
+        // 生成LogSegment对象, 底层方法同时将同名的索引文件加入内存
         val segment = new LogSegment(dir = dir,
           startOffset = startOffset,
-          indexIntervalBytes = config.indexInterval,
-          maxIndexSize = config.maxIndexSize,
-          rollJitterMs = config.randomSegmentJitter,
+          indexIntervalBytes = config.indexInterval, // 插入索引的间隔字节数
+          maxIndexSize = config.maxIndexSize, // 索引文件最大字节数
+          rollJitterMs = config.randomSegmentJitter, // 随机生成的一个数字, 用于错开不同segment的滚动归档时间
           time = time,
           fileAlreadyExists = true)
 
         if (indexFileExists) {
+          // 索引存在, 对索引对象进行校验(在LogSegment的构造方法中已解析对应的索引文件到内存)
           try {
             segment.index.sanityCheck()
             // Resize the time index file to 0 if it is newly created.
@@ -321,6 +329,7 @@ class Log(@volatile var dir: File,
               recoverSegment(segment)
           }
         } else {
+          // 索引不存在, 重构索引
           error("Could not find offset index file corresponding to log file %s, rebuilding index...".format(segment.log.file.getAbsolutePath))
           recoverSegment(segment)
         }
@@ -377,9 +386,11 @@ class Log(@volatile var dir: File,
   private def loadSegments() {
     // first do a pass through the files in the log directory and remove any temporary files
     // and find any interrupted swap operations
+    // 首先遍历log.dirs目录下的所有临时文件, 删除之
     val swapFiles = removeTempFilesAndCollectSwapFiles()
 
     // now do a second pass and load all the log and index files
+    // 然后遍历所有log.dirs装载log(引用)和index(mmap)文件
     loadSegmentFiles()
 
     // Finally, complete any interrupted swap operations. To be crash-safe,
@@ -588,7 +599,7 @@ class Log(@volatile var dir: File,
 
         if (assignOffsets) {
           // assign offsets to the message set
-          val offset = new LongRef(nextOffsetMetadata.messageOffset) // TODO 没看懂这个方法
+          val offset = new LongRef(nextOffsetMetadata.messageOffset)
           appendInfo.firstOffset = offset.value
           val now = time.milliseconds
           val validateAndOffsetAssignResult = try {
@@ -1097,6 +1108,7 @@ class Log(@volatile var dir: File,
   /**
    * Delete any log segments matching the given predicate function,
    * starting with the oldest segment and moving forward until a segment doesn't match.
+   * 按照predicate的条件，删除segment
    *
    * @param predicate A function that takes in a candidate log segment and the next higher segment
    *                  (if there is one) and returns true iff it is deletable
@@ -1170,7 +1182,9 @@ class Log(@volatile var dir: File,
    */
   def deleteOldSegments(): Int = {
     if (!config.delete) return 0
-    deleteRetentionMsBreachedSegments() + deleteRetentionSizeBreachedSegments() + deleteLogStartOffsetBreachedSegments()
+    deleteRetentionMsBreachedSegments() // 按照时间删除, 通过retention.ms配置
+    + deleteRetentionSizeBreachedSegments()  // 按照log总大小删除, 通过retention.bytes配置
+    + deleteLogStartOffsetBreachedSegments() // 删除baseOffset小于logStartOffset的segment
   }
 
   private def deleteRetentionMsBreachedSegments(): Int = {
@@ -1348,7 +1362,7 @@ class Log(@volatile var dir: File,
 
     lock synchronized {
       if(offset > this.recoveryPoint) {
-        this.recoveryPoint = offset
+        this.recoveryPoint = offset // flush
         lastflushedTime.set(time.milliseconds)
       }
     }
@@ -1399,7 +1413,7 @@ class Log(@volatile var dir: File,
 
   /**
    * Truncate this log so that it ends with the greatest offset < targetOffset.
-   *
+   * 回滚当前Log到指定offset
    * @param targetOffset The offset to truncate to, an upper bound on all offsets in the log after truncation is complete.
    */
   private[log] def truncateTo(targetOffset: Long) {
@@ -1411,13 +1425,18 @@ class Log(@volatile var dir: File,
     }
     info("Truncating log %s to offset %d.".format(name, targetOffset))
     lock synchronized {
-      if(segments.firstEntry.getValue.baseOffset > targetOffset) {
+      if(segments.firstEntry.getValue.baseOffset > targetOffset) { // 如果log中缓存的最小offset都小于目标offset, 则彻底删除所有日志, 并将offset重置为targetOffset
         truncateFullyAndStartAt(targetOffset)
       } else {
+        /*baseOffset大于targetOffset的segment都属冲突数据, 过滤出来删除 */
         val deletable = logSegments.filter(segment => segment.baseOffset > targetOffset)
         deletable.foreach(deleteSegment)
+
+        // 活跃segment中还可能存在大于targetOffset的数据, 调用segment.truncateTo删除
         activeSegment.truncateTo(targetOffset)
+        // 更新LEO
         updateLogEndOffset(targetOffset)
+        // 更新recoveryPoint 和 logStartOffset TODO-NOTE what recovery point and leaderEpochCache for?
         this.recoveryPoint = math.min(targetOffset, this.recoveryPoint)
         this.logStartOffset = math.min(targetOffset, this.logStartOffset)
         leaderEpochCache.clearAndFlushLatest(targetOffset)
@@ -1435,24 +1454,27 @@ class Log(@volatile var dir: File,
     debug(s"Truncate and start log '$name' at offset $newOffset")
     lock synchronized {
       val segmentsToDelete = logSegments.toList
-      segmentsToDelete.foreach(deleteSegment)
+      segmentsToDelete.foreach(deleteSegment) // 从log对象中移除所有segment并清理对应的文件, 底层通过文件改名后子线程延迟执行的方法来删除文件
+      // 增加一个新的segment
       addSegment(new LogSegment(dir,
                                 newOffset,
                                 indexIntervalBytes = config.indexInterval,
                                 maxIndexSize = config.maxIndexSize,
                                 rollJitterMs = config.randomSegmentJitter,
                                 time = time,
-                                fileAlreadyExists = false,
+                                fileAlreadyExists = false, // 标记文件不存在, 需要新增
                                 initFileSize = initFileSize,
                                 preallocate = config.preallocate))
+      // 更新log的nextOffsetMetadata为newOffset
       updateLogEndOffset(newOffset)
+      // 移除已有的leaderEpoch缓存
       leaderEpochCache.clearAndFlush()
 
       producerStateManager.truncate()
       producerStateManager.updateMapEndOffset(newOffset)
       updateFirstUnstableOffset()
 
-      this.recoveryPoint = math.min(newOffset, this.recoveryPoint)
+      this.recoveryPoint = math.min(newOffset, this.recoveryPoint) // truncateFullyAndStartAt
       this.logStartOffset = newOffset
     }
   }
@@ -1464,6 +1486,7 @@ class Log(@volatile var dir: File,
 
   /**
    * The active segment that is currently taking appends
+   * 当前活跃segment即segments队列中的最后(新)一个
    */
   def activeSegment = segments.lastEntry.getValue
 
@@ -1503,22 +1526,24 @@ class Log(@volatile var dir: File,
   private def deleteSegment(segment: LogSegment) {
     info("Scheduling log segment %d for log %s for deletion.".format(segment.baseOffset, name))
     lock synchronized {
-      segments.remove(segment.baseOffset)
-      asyncDeleteSegment(segment)
+      segments.remove(segment.baseOffset) // 从log中删除指定的segment, 现在指向该segment的引用就只剩下局部变量, 方法退出后等待gc
+      asyncDeleteSegment(segment) // 异步删除
     }
   }
 
   /**
    * Perform an asynchronous delete on the given file if it exists (otherwise do nothing)
-   *
+   * 异步删除segment文件
    * @throws KafkaStorageException if the file can't be renamed and still exists
    */
   private def asyncDeleteSegment(segment: LogSegment) {
+    // 修改文件尾缀为.delete
     segment.changeFileSuffixes("", Log.DeletedFileSuffix)
     def deleteSeg() {
       info("Deleting segment %d from log %s.".format(segment.baseOffset, name))
-      segment.delete()
+      segment.delete() // 调用自身的删除方法, 清空文件
     }
+    // 通过子线程执行删除工作, 注意fileDeleteDelayMs指定了删除方法的执行延迟, 默认为60秒
     scheduler.schedule("delete-file", deleteSeg _, delay = config.fileDeleteDelayMs)
   }
 

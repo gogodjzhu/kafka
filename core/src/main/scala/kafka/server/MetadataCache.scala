@@ -36,13 +36,17 @@ import org.apache.kafka.common.requests.{MetadataResponse, PartitionState, Updat
 /**
  *  A cache for the state (e.g., current leader) of each partition. This cache is updated through
  *  UpdateMetadataRequest from the controller. Every broker maintains the same cache, asynchronously.
+ *  缓存了所有分区的状态，各broker通过controller发送的UpdateMetadataRequest请求异步更新一致
  */
 class MetadataCache(brokerId: Int) extends Logging {
   private val stateChangeLogger = KafkaController.stateChangeLogger
   private val cache = mutable.Map[String, mutable.Map[Int, PartitionStateInfo]]()
   private var controllerId: Option[Int] = None
+  // brokerId -> Broker
   private val aliveBrokers = mutable.Map[Int, Broker]()
+  // brokerId -> Map<Listener, Node>
   private val aliveNodes = mutable.Map[Int, collection.Map[ListenerName, Node]]()
+  // 分读写锁，读 & 写 操作均需在获取对应锁的前提下执行
   private val partitionMetadataLock = new ReentrantReadWriteLock()
 
   this.logIdent = s"[Kafka Metadata Cache on broker $brokerId] "
@@ -181,8 +185,10 @@ class MetadataCache(brokerId: Int) extends Logging {
   def getControllerId: Option[Int] = controllerId
 
   // This method returns the deleted TopicPartitions received from UpdateMetadataRequest
+  // 根据controller发送的 updateMetadataRequest 更新当前broker保存的元数据缓存
   def updateCache(correlationId: Int, updateMetadataRequest: UpdateMetadataRequest): Seq[TopicPartition] = {
     inWriteLock(partitionMetadataLock) {
+      // 更新controllerId
       controllerId = updateMetadataRequest.controllerId match {
           case id if id < 0 => None
           case id => Some(id)
@@ -207,12 +213,12 @@ class MetadataCache(brokerId: Int) extends Logging {
       updateMetadataRequest.partitionStates.asScala.foreach { case (tp, info) =>
         val controllerId = updateMetadataRequest.controllerId
         val controllerEpoch = updateMetadataRequest.controllerEpoch
-        if (info.leader == LeaderAndIsr.LeaderDuringDelete) {
+        if (info.leader == LeaderAndIsr.LeaderDuringDelete) { // 标记为删除的partition
           removePartitionInfo(tp.topic, tp.partition)
           stateChangeLogger.trace(s"Broker $brokerId deleted partition $tp from metadata cache in response to UpdateMetadata " +
             s"request sent by controller $controllerId epoch $controllerEpoch with correlation id $correlationId")
           deletedPartitions += tp
-        } else {
+        } else { // 正常partition
           val partitionInfo = partitionStateToPartitionStateInfo(info)
           addOrUpdatePartitionInfo(tp.topic, tp.partition, partitionInfo)
           stateChangeLogger.trace(s"Broker $brokerId cached leader info $partitionInfo for partition $tp in response to " +

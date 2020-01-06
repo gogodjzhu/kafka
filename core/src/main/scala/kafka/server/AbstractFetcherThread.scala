@@ -99,7 +99,10 @@ abstract class AbstractFetcherThread(name: String,
   private def states() = partitionStates.partitionStates.asScala.map { state => state.topicPartition -> state.value }
 
   override def doWork() {
+    // 处理可能出现的回滚replica offset的操作. 仅在新加入同步的PartitionState中执行一次
     maybeTruncate()
+
+    // 下面开始正常的FetchRequest向leader拉取消息
     val fetchRequest = inLock(partitionMapLock) {
       val fetchRequest = buildFetchRequest(states)
       if (fetchRequest.isEmpty) {
@@ -109,7 +112,7 @@ abstract class AbstractFetcherThread(name: String,
       fetchRequest
     }
     if (!fetchRequest.isEmpty)
-      processFetchRequest(fetchRequest)
+      processFetchRequest(fetchRequest) // 在当前replica中持久化从leader拉取的数据
   }
 
   /**
@@ -122,15 +125,20 @@ abstract class AbstractFetcherThread(name: String,
     *   occur during truncation.
     */
   def maybeTruncate(): Unit = {
+    // 构造指向partition的LeaderEpochRequest请求, 底层只有ReplicaFetcherThread实现了请求构造, 本质是依赖PartitionFetchState.isTruncatingLog=true
+    // 过滤出需要向leader同步的partition. 后续的操作会执行一次当前replica(follower)向leader同步offset的操作, 以确定后续fetch操作的
+    // 初始offset
     val epochRequests = inLock(partitionMapLock) { buildLeaderEpochRequest(states) }
 
-    if (!epochRequests.isEmpty) {
+    if (!epochRequests.isEmpty) { // 只有replicaFetcherThread构造了非空集合
       val fetchedEpochs = fetchEpochsFromLeader(epochRequests)
       //Ensure we hold a lock during truncation.
       inLock(partitionMapLock) {
         //Check no leadership changes happened whilst we were unlocked, fetching epochs
         val leaderEpochs = fetchedEpochs.filter { case (tp, _) => partitionStates.contains(tp) }
+        // maybeTruncate
         val truncationPoints = maybeTruncate(leaderEpochs)
+        // 将truncate后的数据写回FetcherThread的缓存
         markTruncationComplete(truncationPoints)
       }
     }
@@ -141,6 +149,7 @@ abstract class AbstractFetcherThread(name: String,
 
     def updatePartitionsWithError(partition: TopicPartition): Unit = {
       partitionsWithError += partition
+      // 拉取失败, 将这个partition移到ListedMap尾部
       partitionStates.moveToEnd(partition)
     }
 
@@ -148,7 +157,7 @@ abstract class AbstractFetcherThread(name: String,
 
     try {
       trace(s"Issuing fetch to broker ${sourceBroker.id}, request: $fetchRequest")
-      responseData = fetch(fetchRequest)
+      responseData = fetch(fetchRequest) // 同步请求
     } catch {
       case t: Throwable =>
         if (isRunning.get) {
@@ -178,9 +187,11 @@ abstract class AbstractFetcherThread(name: String,
                 case Errors.NONE =>
                   try {
                     val records = partitionData.toRecords
+                    // batch中最后一条消息的nextOffset
                     val newOffset = records.batches.asScala.lastOption.map(_.nextOffset).getOrElse(
                       currentPartitionFetchState.fetchOffset)
 
+                    // 更新距离HW的消息延迟
                     fetcherLagStats.getAndMaybePut(topic, partitionId).lag = Math.max(0L, partitionData.highWatermark - newOffset)
                     // Once we hand off the partition data to the subclass, we can't mess with it any more in this thread
                     processPartitionData(topicPartition, currentPartitionFetchState.fetchOffset, partitionData)
@@ -188,6 +199,7 @@ abstract class AbstractFetcherThread(name: String,
                     val validBytes = records.validBytes
                     if (validBytes > 0) {
                       // Update partitionStates only if there is no exception during processPartitionData
+                      // processPartitionData方法成功处理消息后移动TP的offset
                       partitionStates.updateAndMoveToEnd(topicPartition, new PartitionFetchState(newOffset))
                       fetcherStats.byteRate.mark(validBytes)
                     }
@@ -240,6 +252,9 @@ abstract class AbstractFetcherThread(name: String,
       val newPartitionToState = partitionAndOffsets.filter { case (tp, _) =>
         !partitionStates.contains(tp)
       }.map { case (tp, offset) =>
+        // 注意构造PartitionFetchState的第二个参数includeLogTruncation, 在ReplicaFetchThread中固定为true, 即第一次添加PartitionFetchState
+        // 时需要follower发起一次指向leader的LeaderEpochRequest同步请求以更新follower后续想Leader同步数据的初始offset. 这种同步
+        // 进度的操作消耗巨大, 因此在第一次更新初始offset之后会将对应PartitionFetchState.includeLogTruncation置为false
         val fetchState =
           if (offset < 0)
             new PartitionFetchState(handleOffsetOutOfRange(tp), includeLogTruncation)
@@ -258,9 +273,12 @@ abstract class AbstractFetcherThread(name: String,
     * @param partitions the partitions to mark truncation complete
     */
   private def markTruncationComplete(partitions: Map[TopicPartition, Long]) {
+    // 遍历所有partitionStates, 找出truncate涉及的partition. 这里用truncate后的offset更新partitionFetcherState, 下次从新的offset开始向leader拉取数据
+    // 同时还有有一个很重要的, 改变这些partitionFetchState.truncatingLog为false
     val newStates: Map[TopicPartition, PartitionFetchState] = partitionStates.partitionStates.asScala
       .map { state =>
         val maybeTruncationComplete = partitions.get(state.topicPartition()) match {
+          // truncatingLog标记修改为false, 下次不需要根据Fetcher结果来truncate
           case Some(offset) => new PartitionFetchState(offset, state.value.delay, truncatingLog = false)
           case None => state.value()
         }
